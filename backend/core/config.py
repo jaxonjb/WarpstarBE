@@ -16,7 +16,7 @@ class Settings(BaseSettings):
 
     # App
     app_env: str = "development"
-    cors_origins: list[str] = ["http://localhost:3000"]
+    cors_origins: list[str] = ["http://localhost:5173"]
 
     class Config:
         env_file = str(Path(__file__).parent.parent / ".env")
