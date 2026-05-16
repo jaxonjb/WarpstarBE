@@ -66,6 +66,33 @@ def _resolve_games(games: list, maps: dict) -> list:
     return [_resolve_game(g, maps) for g in games]
 
 
+
+async def _enrich_reviews(reviews: list, db) -> list:
+    """Add username and avatar to each review doc."""
+    if not reviews:
+        return reviews
+    # Collect unique user IDs
+    user_ids = list({r["userId"] for r in reviews if r.get("userId")})
+    users = await db.users.find(
+        {"_id": {"$in": user_ids}},
+        {"_id": 1, "username": 1, "preferences": 1}
+    ).to_list(length=None)
+    user_map = {
+        str(u["_id"]): {
+            "username": u.get("username", "unknown"),
+            "avatar":   u.get("preferences", {}).get("profilePicture"),
+        }
+        for u in users
+    }
+    enriched = []
+    for r in reviews:
+        doc = serialize_doc(r)
+        uid = str(r.get("userId", ""))
+        doc["username"] = user_map.get(uid, {}).get("username", "unknown")
+        doc["avatar"]   = user_map.get(uid, {}).get("avatar")
+        enriched.append(doc)
+    return enriched
+
 def _build_filter(
     q: str | None,
     genre: str | None,
@@ -200,4 +227,5 @@ async def get_game_reviews(
     cursor  = db.reviews.find({"gameId": oid}).sort("createdAt", -1).skip(skip).limit(limit)
     reviews = await cursor.to_list(length=limit)
     total   = await db.reviews.count_documents({"gameId": oid})
-    return {"total": total, "skip": skip, "limit": limit, "results": serialize_docs(reviews)}
+    enriched = await _enrich_reviews(reviews, db)
+    return {"total": total, "skip": skip, "limit": limit, "results": enriched}

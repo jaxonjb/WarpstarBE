@@ -75,72 +75,79 @@ async def login(body: LoginRequest, db=Depends(get_db)):
 
 @router.post("/google", response_model=TokenResponse)
 async def google_login(body: GoogleLoginRequest, db=Depends(get_db)):
-    """
-    Accepts a Google OAuth access token from the frontend,
-    fetches the user's profile from Google, then finds or creates
-    the user in our DB and returns our own JWT pair.
-    """
-    # Verify the token by fetching the user's Google profile
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://www.googleapis.com/oauth2/v1/userinfo",
-            headers={"Authorization": f"Bearer {body.credential}"},
+    from google.oauth2 import id_token
+    from google.auth.transport import requests as google_requests
+    import traceback
+    print(f"DEBUG client_id: '{settings.google_client_id}'")
+    print(f"DEBUG mongodb_uri starts with: '{settings.mongodb_uri[:20] if settings.mongodb_uri else 'EMPTY'}'")
+    client_id = settings.google_client_id
+    if not client_id:
+        raise HTTPException(status_code=500, detail="Google client ID not configured.")
+
+    try:
+        id_info = id_token.verify_oauth2_token(
+            body.credential,
+            google_requests.Request(),
+            client_id,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
+    except Exception as e:
+        print(f"ERROR verifying token: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Token verification error: {type(e).__name__}: {e}")
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid Google token.")
-
-    google_user = resp.json()
-    email       = google_user.get("email")
-    name        = google_user.get("name", "")
-    picture     = google_user.get("picture", "")
-    google_id   = google_user.get("id", "")
+    email     = id_info.get("email")
+    name      = id_info.get("name", "")
+    picture   = id_info.get("picture", "")
+    google_id = id_info.get("sub", "")
 
     if not email:
         raise HTTPException(status_code=400, detail="Could not retrieve email from Google.")
 
-    # Find existing user by email
-    user = await db.users.find_one({"email": email})
+    try:
+        user = await db.users.find_one({"email": email})
 
-    if user:
-        # Update profile picture if changed
-        if picture and user.get("preferences", {}).get("profilePicture") != picture:
-            await db.users.update_one(
-                {"_id": user["_id"]},
-                {"$set": {"preferences.profilePicture": picture}},
-            )
-        user_id = str(user["_id"])
-    else:
-        # Create new user — generate a unique username from their Google name
-        base_username = _slugify_username(name)
-        username      = base_username
-        suffix        = 1
-        while await db.users.find_one({"username": username}):
-            username = f"{base_username}_{suffix}"
-            suffix  += 1
+        if user:
+            if picture and user.get("preferences", {}).get("profilePicture") != picture:
+                await db.users.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"preferences.profilePicture": picture}},
+                )
+            user_id = str(user["_id"])
+        else:
+            base_username = _slugify_username(name)
+            username      = base_username
+            suffix        = 1
+            while await db.users.find_one({"username": username}):
+                username = f"{base_username}_{suffix}"
+                suffix  += 1
 
-        now = datetime.now(timezone.utc)
-        doc = {
-            "username":      username,
-            "email":         email,
-            "googleId":      google_id,
-            "favoriteGames": [],
-            "followers":     [],
-            "following":     [],
-            "preferences":   {
-                "displayName":    name,
-                "profilePicture": picture,
-            },
-            "createdAt": now,
-        }
-        result  = await db.users.insert_one(doc)
-        user_id = str(result.inserted_id)
+            now = datetime.now(timezone.utc)
+            doc = {
+                "username":      username,
+                "email":         email,
+                "googleId":      google_id,
+                "favoriteGames": [],
+                "followers":     [],
+                "following":     [],
+                "preferences":   {
+                    "displayName":    name,
+                    "profilePicture": picture,
+                },
+                "createdAt": now,
+            }
+            result  = await db.users.insert_one(doc)
+            user_id = str(result.inserted_id)
 
-    return TokenResponse(
-        access_token=create_access_token(user_id),
-        refresh_token=create_refresh_token(user_id),
-    )
-
+        return TokenResponse(
+            access_token=create_access_token(user_id),
+            refresh_token=create_refresh_token(user_id),
+        )
+    except Exception as e:
+        print(f"ERROR in DB operations: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Database error: {type(e).__name__}: {e}")
 
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh(body: RefreshRequest, db=Depends(get_db)):

@@ -27,7 +27,17 @@ app = FastAPI(
     description="Backend API for the game review and discovery platform.",
     lifespan=lifespan,
 )
+import traceback
+from fastapi import Request
+from fastapi.responses import JSONResponse
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {str(exc)}"}
+    )
 # ---------------------------------------------------------------------------
 # CORS
 # ---------------------------------------------------------------------------

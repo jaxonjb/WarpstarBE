@@ -108,3 +108,24 @@ async def get_favorites(current_user=Depends(get_current_user), db=Depends(get_d
     ids = current_user.get("favoriteGames") or []
     games = await db.games.find({"_id": {"$in": ids}}).to_list(length=None)
     return serialize_docs(games)
+
+# ---------------------------------------------------------------------------
+# User reviews — public endpoint for profile page
+# ---------------------------------------------------------------------------
+
+@router.get("/{user_id}/reviews")
+async def get_user_reviews(
+    user_id: str,
+    skip:  int = 0,
+    limit: int = 20,
+    db=Depends(get_db),
+):
+    try:
+        oid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID.")
+
+    cursor  = db.reviews.find({"userId": oid}).sort("createdAt", -1).skip(skip).limit(limit)
+    reviews = await cursor.to_list(length=limit)
+    total   = await db.reviews.count_documents({"userId": oid})
+    return {"total": total, "skip": skip, "limit": limit, "results": serialize_docs(reviews)}
