@@ -2,10 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 from datetime import datetime, timezone
 
-from ..core.database import get_db
-from ..core.security import get_current_user, get_current_user_optional
-from ..core.utils import serialize_doc, serialize_docs
-from ..schemas.list_comment import ListCreate, ListUpdate, ListAddGame
+from core.database import get_db
+from core.security import get_current_user, get_current_user_optional
+from core.utils import serialize_doc, serialize_docs
+from schemas.list_comment import ListCreate, ListUpdate, ListAddGame
 
 router = APIRouter(prefix="/api/lists", tags=["lists"])
 

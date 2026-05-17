@@ -7,8 +7,8 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from bson import ObjectId
 
-from .config import get_settings
-from .database import get_db
+from core.config import get_settings
+from core.database import get_db
 
 settings = get_settings()
 

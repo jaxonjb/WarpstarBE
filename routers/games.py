@@ -2,9 +2,9 @@ import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 
-from ..core.database import get_db
-from ..core.security import get_current_user_optional
-from ..core.utils import serialize_doc, serialize_docs
+from core.database import get_db
+from core.security import get_current_user_optional
+from core.utils import serialize_doc, serialize_docs
 
 router = APIRouter(prefix="/api/games", tags=["games"])
 

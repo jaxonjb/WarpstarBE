@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, Query
 from bson import ObjectId
 from datetime import datetime, timezone
 
-from ..core.database import get_db
-from ..core.security import get_current_user
-from ..core.utils import serialize_doc, serialize_docs
+from core.database import get_db
+from core.security import get_current_user
+from core.utils import serialize_doc, serialize_docs
 
 router = APIRouter(prefix="/api/feed", tags=["feed"])
 

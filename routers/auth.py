@@ -6,16 +6,16 @@ from pydantic import BaseModel
 import httpx
 import re
 
-from ..core.database import get_db
-from ..core.security import (
+from core.database import get_db
+from core.security import (
     hash_password,
     verify_password,
     create_access_token,
     create_refresh_token,
     get_settings,
 )
-from ..core.utils import serialize_doc
-from ..schemas.user import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest
+from core.utils import serialize_doc
+from schemas.user import RegisterRequest, LoginRequest, TokenResponse, RefreshRequest
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 settings = get_settings()

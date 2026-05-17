@@ -2,9 +2,11 @@ from fastapi import FastAPI  # type: ignore[import]
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore[import]
 from contextlib import asynccontextmanager
 
-from .core.config import get_settings
-from .core.database import get_client, close_db
-from .routers import auth, users, games, reviews, lists, feed
+from routers import auth, feed, games, lists, reviews
+
+from core.config import get_settings
+from core.database import get_client, close_db
+from routers import users
 
 settings = get_settings()
 

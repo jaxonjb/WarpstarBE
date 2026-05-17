@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     ]
  
     class Config:
-        env_file = str(Path(__file__).parent.parent / ".env")
+        env_file = str(Path(__file__).parent / ".env")
         env_file_encoding = "utf-8"
  
  
