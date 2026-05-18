@@ -20,9 +20,9 @@ class Settings(BaseSettings):
     app_env: str = "development"
     cors_origins: list[str] = [
         "http://localhost:5173",
-        "https://warpstar.us",
-        "https://www.warpstar.us",
-    ]
+        "https://warpstar.space",
+        "https://www.warpstar.space",
+]
  
     class Config:
         env_file = str(Path(__file__).parent / ".env")
