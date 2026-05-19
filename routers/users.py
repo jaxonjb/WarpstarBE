@@ -6,7 +6,6 @@ from core.database import get_db
 from core.security import get_current_user
 from core.utils import serialize_doc, serialize_docs
 from schemas.user import UserPublic, UserUpdate, FollowResponse
-
 router = APIRouter(prefix="/api/users", tags=["users"])
 
 
@@ -28,6 +27,14 @@ async def update_me(body: UserUpdate, current_user=Depends(get_current_user), db
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update.")
+
+    # If username is being changed, check it's not already taken
+    if "username" in updates:
+        new_username = updates["username"]
+        existing = await db.users.find_one({"username": new_username, "_id": {"$ne": current_user["_id"]}})
+        if existing:
+            raise HTTPException(status_code=409, detail="Username already taken.")
+
     await db.users.update_one({"_id": current_user["_id"]}, {"$set": updates})
     updated = await db.users.find_one({"_id": current_user["_id"]})
     return _user_public(updated)
@@ -128,4 +135,14 @@ async def get_user_reviews(
     cursor  = db.reviews.find({"userId": oid}).sort("createdAt", -1).skip(skip).limit(limit)
     reviews = await cursor.to_list(length=limit)
     total   = await db.reviews.count_documents({"userId": oid})
-    return {"total": total, "skip": skip, "limit": limit, "results": serialize_docs(reviews)}
+
+    # Look up the user once to attach username/avatar to every review
+    profile = await db.users.find_one({"_id": oid}, {"username": 1, "preferences": 1})
+    enriched = []
+    for r in reviews:
+        doc = serialize_doc(r)
+        doc["username"] = profile.get("username", "unknown") if profile else "unknown"
+        doc["avatar"]   = profile.get("preferences", {}).get("profilePicture") if profile else None
+        enriched.append(doc)
+
+    return {"total": total, "skip": skip, "limit": limit, "results": enriched}

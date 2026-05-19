@@ -1,6 +1,9 @@
-from fastapi import FastAPI  # type: ignore[import]
+from fastapi import FastAPI, Request
+ # type: ignore[import]
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore[import]
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import traceback
 
 from routers import auth, feed, games, lists, reviews
 
@@ -29,9 +32,6 @@ app = FastAPI(
     description="Backend API for the game review and discovery platform.",
     lifespan=lifespan,
 )
-import traceback
-from fastapi import Request
-from fastapi.responses import JSONResponse
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):

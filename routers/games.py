@@ -15,14 +15,15 @@ router = APIRouter(prefix="/api/games", tags=["games"])
 
 async def _build_lookup_maps(db) -> dict:
     """
-    Load genres, themes, and platforms into igdbId->name maps.
-    Games store IGDB numeric IDs in genreIds/themeIds/platformIds
-    (e.g. 5, 31) — the lookup collections store those in igdbId.
+    Load genres, themes, platforms, and keywords into igdbId->name maps.
+    
+    Games store IGDB numeric IDs — the lookup collections store those in igdbId.
     Both int and string keys are stored so either format matches.
     """
     genres    = await db.genres.find({},    {"igdbId": 1, "name": 1}).to_list(length=None)
     themes    = await db.themes.find({},    {"igdbId": 1, "name": 1}).to_list(length=None)
     platforms = await db.platforms.find({}, {"igdbId": 1, "name": 1}).to_list(length=None)
+    keywords  = await db.keywords.find({},  {"igdbId": 1, "name": 1}).to_list(length=None)
 
     def make_map(docs):
         m = {}
@@ -40,6 +41,7 @@ async def _build_lookup_maps(db) -> dict:
         "genres":    make_map(genres),
         "themes":    make_map(themes),
         "platforms": make_map(platforms),
+        "keywords":  make_map(keywords),
     }
 
 
@@ -50,6 +52,8 @@ def _resolve_game(game: dict, maps: dict) -> dict:
       genreIds    -> genres    (list of name strings)
       themeIds    -> themes
       platformIds -> platforms
+      keywordIds  -> keywords  (capped at 10 for response size)
+    Also ensures igdbRatingCount is present (defaults to 0).
     """
     doc = serialize_doc(game)
     if doc is None:
@@ -58,6 +62,11 @@ def _resolve_game(game: dict, maps: dict) -> dict:
     doc["genres"]    = [maps["genres"].get(gid)    for gid in (doc.get("genreIds")    or []) if maps["genres"].get(gid)]
     doc["themes"]    = [maps["themes"].get(tid)    for tid in (doc.get("themeIds")    or []) if maps["themes"].get(tid)]
     doc["platforms"] = [maps["platforms"].get(pid) for pid in (doc.get("platformIds") or []) if maps["platforms"].get(pid)]
+    doc["keywords"]  = [maps["keywords"].get(kid)  for kid in (doc.get("keywordIds")  or [])[:10] if maps["keywords"].get(kid)]
+
+    # Ensure igdbRatingCount is always present
+    if "igdbRatingCount" not in doc:
+        doc["igdbRatingCount"] = 0
 
     return doc
 
@@ -130,7 +139,7 @@ async def list_games(
     genre:    str | None = Query(None, description="Filter by genre ID"),
     platform: str | None = Query(None, description="Filter by platform ID"),
     theme:    str | None = Query(None, description="Filter by theme ID"),
-    sort:     str        = Query("reviewTotal", enum=["reviewTotal", "igdbRating", "releaseDate", "name"]),
+    sort:     str        = Query("reviewTotal", enum=["reviewTotal", "igdbRating", "igdbRatingCount", "releaseDate", "name"]),
     skip:     int        = Query(0,  ge=0),
     limit:    int        = Query(20, ge=1, le=100),
     db=Depends(get_db),
