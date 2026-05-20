@@ -16,7 +16,6 @@ router = APIRouter(prefix="/api/games", tags=["games"])
 async def _build_lookup_maps(db) -> dict:
     """
     Load genres, themes, platforms, and keywords into igdbId->name maps.
-    
     Games store IGDB numeric IDs — the lookup collections store those in igdbId.
     Both int and string keys are stored so either format matches.
     """
@@ -102,30 +101,67 @@ async def _enrich_reviews(reviews: list, db) -> list:
         enriched.append(doc)
     return enriched
 
-def _build_filter(
+async def _build_filter(
     q: str | None,
     genre: str | None,
     platform: str | None,
     theme: str | None,
+    db = None,
 ) -> dict:
+    """
+    Build a MongoDB filter dict. Genre/platform/theme params can be:
+      - An IGDB numeric ID (int or string like "12")
+      - A genre name string like "Action" (resolved via genres collection)
+    """
     f: dict = {}
     if q:
         f["name"] = {"$regex": re.escape(q.strip()), "$options": "i"}
-    if genre:
+
+    if genre and db is not None:
+        # Try as integer IGDB ID first
         try:
-            f["genreIds"] = ObjectId(genre)
-        except Exception:
-            pass
-    if platform:
+            igdb_id = int(genre)
+            f["genreIds"] = igdb_id
+        except ValueError:
+            # Otherwise look up by name in the genres collection
+            genre_doc = await db.genres.find_one(
+                {"name": {"$regex": f"^{re.escape(genre)}$", "$options": "i"}},
+                {"igdbId": 1}
+            )
+            if genre_doc:
+                try:
+                    f["genreIds"] = int(genre_doc["igdbId"])
+                except (ValueError, TypeError):
+                    f["genreIds"] = genre_doc["igdbId"]
+
+    if platform and db is not None:
         try:
-            f["platformIds"] = ObjectId(platform)
-        except Exception:
-            pass
-    if theme:
+            f["platformIds"] = int(platform)
+        except ValueError:
+            platform_doc = await db.platforms.find_one(
+                {"name": {"$regex": f"^{re.escape(platform)}$", "$options": "i"}},
+                {"igdbId": 1}
+            )
+            if platform_doc:
+                try:
+                    f["platformIds"] = int(platform_doc["igdbId"])
+                except (ValueError, TypeError):
+                    f["platformIds"] = platform_doc["igdbId"]
+
+    if theme and db is not None:
         try:
-            f["themeIds"] = ObjectId(theme)
-        except Exception:
-            pass
+            f["themeIds"] = int(theme)
+        except ValueError:
+            theme_doc = await db.themes.find_one(
+                {"name": {"$regex": f"^{re.escape(theme)}$", "$options": "i"}},
+                {"igdbId": 1}
+            )
+            if theme_doc:
+                try:
+                    f["themeIds"] = int(theme_doc["igdbId"])
+                except (ValueError, TypeError):
+                    f["themeIds"] = theme_doc["igdbId"]
+
     return f
 
 
@@ -139,12 +175,64 @@ async def list_games(
     genre:    str | None = Query(None, description="Filter by genre ID"),
     platform: str | None = Query(None, description="Filter by platform ID"),
     theme:    str | None = Query(None, description="Filter by theme ID"),
-    sort:     str        = Query("reviewTotal", enum=["reviewTotal", "igdbRating", "igdbRatingCount", "releaseDate", "name"]),
+    sort:     str        = Query("reviewTotal", enum=["reviewTotal", "igdbRating", "igdbRatingCount", "topRated", "releaseDate", "name"]),
     skip:     int        = Query(0,  ge=0),
     limit:    int        = Query(20, ge=1, le=100),
     db=Depends(get_db),
 ):
-    filt      = _build_filter(q, genre, platform, theme)
+    filt = await _build_filter(q, genre, platform, theme, db)
+
+    # topRated: prioritise games reviewed on Warpstar first (reviewTotal > 0),
+    # then fall back to IGDB rating with a minimum of 20 IGDB ratings
+    if sort == "topRated":
+        IGDB_MIN_RATINGS = 50
+        pipeline = [
+            {"$match": filt},
+            {"$addFields": {
+                # Tier 0 = has Warpstar reviews, Tier 1 = IGDB only (meets threshold)
+                "_tier": {
+                    "$cond": [{"$gt": ["$reviewTotal", 0]}, 0, 1]
+                },
+                # Within tier 1, exclude games below the IGDB rating count threshold
+                "_igdbCount": {"$ifNull": ["$igdbRatingCount", 0]},
+            }},
+            # Drop IGDB-only games that don't meet the minimum rating count
+            {"$match": {
+                "$or": [
+                    {"reviewTotal": {"$gt": 0}},
+                    {"_igdbCount": {"$gte": IGDB_MIN_RATINGS}},
+                ]
+            }},
+            {"$sort": {
+                "_tier":        1,   # Warpstar-reviewed games first
+                "reviewTotal":  -1,  # Within tier 0: most reviewed first
+                "igdbRating":   -1,  # Within tier 1: highest IGDB rating first
+            }},
+            {"$skip":  skip},
+            {"$limit": limit},
+        ]
+        count_pipeline = [
+            {"$match": filt},
+            {"$addFields": {"_igdbCount": {"$ifNull": ["$igdbRatingCount", 0]}}},
+            {"$match": {"$or": [
+                {"reviewTotal": {"$gt": 0}},
+                {"_igdbCount": {"$gte": IGDB_MIN_RATINGS}},
+            ]}},
+            {"$count": "total"},
+        ]
+        games_cursor  = db.games.aggregate(pipeline)
+        count_cursor  = db.games.aggregate(count_pipeline)
+        games         = await games_cursor.to_list(length=limit)
+        count_result  = await count_cursor.to_list(length=1)
+        total         = count_result[0]["total"] if count_result else 0
+        maps          = await _build_lookup_maps(db)
+        return {
+            "total":   total,
+            "skip":    skip,
+            "limit":   limit,
+            "results": _resolve_games(games, maps),
+        }
+
     direction = 1 if sort == "name" else -1
     cursor    = db.games.find(filt).sort(sort, direction).skip(skip).limit(limit)
     games     = await cursor.to_list(length=limit)
