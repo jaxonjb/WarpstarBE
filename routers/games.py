@@ -1,28 +1,40 @@
 import re
+import time
+import asyncio
+import unicodedata
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 
 from core.database import get_db
-from core.security import get_current_user_optional
 from core.utils import serialize_doc, serialize_docs
 
 router = APIRouter(prefix="/api/games", tags=["games"])
 
 
 # ---------------------------------------------------------------------------
-# Lookup helpers
+# In-memory lookup map cache
+# Lookup tables (genres, platforms etc.) rarely change so we cache them for
+# 10 minutes instead of hitting MongoDB on every request.
 # ---------------------------------------------------------------------------
 
+_LOOKUP_CACHE: dict = {}
+_CACHE_TTL    = 600  # seconds
+
+
 async def _build_lookup_maps(db) -> dict:
-    """
-    Load genres, themes, platforms, and keywords into igdbId->name maps.
-    Games store IGDB numeric IDs — the lookup collections store those in igdbId.
-    Both int and string keys are stored so either format matches.
-    """
-    genres    = await db.genres.find({},    {"igdbId": 1, "name": 1}).to_list(length=None)
-    themes    = await db.themes.find({},    {"igdbId": 1, "name": 1}).to_list(length=None)
-    platforms = await db.platforms.find({}, {"igdbId": 1, "name": 1}).to_list(length=None)
-    keywords  = await db.keywords.find({},  {"igdbId": 1, "name": 1}).to_list(length=None)
+    global _LOOKUP_CACHE
+
+    now = time.monotonic()
+    if _LOOKUP_CACHE.get("_expires", 0) > now:
+        return _LOOKUP_CACHE
+
+    genres, themes, platforms, keywords, companies = await asyncio.gather(
+        db.genres.find({},    {"igdbId": 1, "name": 1}).to_list(length=None),
+        db.themes.find({},    {"igdbId": 1, "name": 1}).to_list(length=None),
+        db.platforms.find({}, {"igdbId": 1, "name": 1}).to_list(length=None),
+        db.keywords.find({},  {"igdbId": 1, "name": 1}).to_list(length=None),
+        db.companies.find({}, {"igdbId": 1, "name": 1}).to_list(length=None),
+    )
 
     def make_map(docs):
         m = {}
@@ -36,34 +48,33 @@ async def _build_lookup_maps(db) -> dict:
                     pass
         return m
 
-    return {
+    _LOOKUP_CACHE = {
         "genres":    make_map(genres),
         "themes":    make_map(themes),
         "platforms": make_map(platforms),
         "keywords":  make_map(keywords),
+        "companies": make_map(companies),
+        "_expires":  now + _CACHE_TTL,
     }
+    return _LOOKUP_CACHE
 
+
+# ---------------------------------------------------------------------------
+# Game resolver
+# ---------------------------------------------------------------------------
 
 def _resolve_game(game: dict, maps: dict) -> dict:
-    """
-    Serialize a game doc and add resolved name lists alongside the
-    existing ID arrays so the frontend can use either.
-      genreIds    -> genres    (list of name strings)
-      themeIds    -> themes
-      platformIds -> platforms
-      keywordIds  -> keywords  (capped at 10 for response size)
-    Also ensures igdbRatingCount is present (defaults to 0).
-    """
     doc = serialize_doc(game)
     if doc is None:
         return doc
 
-    doc["genres"]    = [maps["genres"].get(gid)    for gid in (doc.get("genreIds")    or []) if maps["genres"].get(gid)]
-    doc["themes"]    = [maps["themes"].get(tid)    for tid in (doc.get("themeIds")    or []) if maps["themes"].get(tid)]
-    doc["platforms"] = [maps["platforms"].get(pid) for pid in (doc.get("platformIds") or []) if maps["platforms"].get(pid)]
-    doc["keywords"]  = [maps["keywords"].get(kid)  for kid in (doc.get("keywordIds")  or [])[:10] if maps["keywords"].get(kid)]
+    doc["genres"]     = [maps["genres"].get(gid)    for gid in (doc.get("genreIds")     or []) if maps["genres"].get(gid)]
+    doc["themes"]     = [maps["themes"].get(tid)    for tid in (doc.get("themeIds")     or []) if maps["themes"].get(tid)]
+    doc["platforms"]  = [maps["platforms"].get(pid) for pid in (doc.get("platformIds")  or []) if maps["platforms"].get(pid)]
+    doc["keywords"]   = [maps["keywords"].get(kid)  for kid in (doc.get("keywordIds")   or [])[:10] if maps["keywords"].get(kid)]
+    doc["developers"] = [maps["companies"].get(cid) for cid in (doc.get("developerIds") or [])[:5]  if maps["companies"].get(cid)]
+    doc["publishers"] = [maps["companies"].get(cid) for cid in (doc.get("publisherIds") or [])[:5]  if maps["companies"].get(cid)]
 
-    # Ensure igdbRatingCount is always present
     if "igdbRatingCount" not in doc:
         doc["igdbRatingCount"] = 0
 
@@ -74,107 +85,87 @@ def _resolve_games(games: list, maps: dict) -> list:
     return [_resolve_game(g, maps) for g in games]
 
 
+# ---------------------------------------------------------------------------
+# Filter builder
+# ---------------------------------------------------------------------------
 
-async def _enrich_reviews(reviews: list, db) -> list:
-    """Add username and avatar to each review doc."""
-    if not reviews:
-        return reviews
-    # Collect unique user IDs
-    user_ids = list({r["userId"] for r in reviews if r.get("userId")})
-    users = await db.users.find(
-        {"_id": {"$in": user_ids}},
-        {"_id": 1, "username": 1, "preferences": 1}
-    ).to_list(length=None)
-    user_map = {
-        str(u["_id"]): {
-            "username": u.get("username", "unknown"),
-            "avatar":   u.get("preferences", {}).get("profilePicture"),
-        }
-        for u in users
-    }
-    enriched = []
-    for r in reviews:
-        doc = serialize_doc(r)
-        uid = str(r.get("userId", ""))
-        doc["username"] = user_map.get(uid, {}).get("username", "unknown")
-        doc["avatar"]   = user_map.get(uid, {}).get("avatar")
-        enriched.append(doc)
-    return enriched
+def _normalize(text: str) -> str:
+    nfd = unicodedata.normalize("NFD", text)
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
 
-async def _build_filter(
-    q: str | None,
-    genre: str | None,
-    platform: str | None,
-    theme: str | None,
-    db = None,
-) -> dict:
-    """
-    Build a MongoDB filter dict. Genre/platform/theme params can be:
-      - An IGDB numeric ID (int or string like "12")
-      - A genre name string like "Action" (resolved via genres collection)
-    """
+
+async def _build_filter(q, genre, platform, theme, db=None) -> dict:
     f: dict = {}
+
     if q:
-        f["name"] = {"$regex": re.escape(q.strip()), "$options": "i"}
+        raw       = q.strip()
+        ascii_q   = _normalize(raw)
+        esc_raw   = re.escape(raw)
+        esc_ascii = re.escape(ascii_q)
+
+        # Always search nameNormalized with the ascii-stripped query —
+        # it's indexed and handles accents efficiently.
+        # Only add name search as a fallback for the original query.
+        if esc_raw == esc_ascii:
+            f["$or"] = [
+                {"nameNormalized": {"$regex": esc_ascii, "$options": "i"}},
+                {"name":           {"$regex": esc_raw,   "$options": "i"}},
+            ]
+        else:
+            f["$or"] = [
+                {"nameNormalized": {"$regex": esc_ascii, "$options": "i"}},
+                {"name":           {"$regex": esc_raw,   "$options": "i"}},
+            ]
 
     if genre and db is not None:
-        # Try as integer IGDB ID first
         try:
-            igdb_id = int(genre)
-            f["genreIds"] = igdb_id
+            f["genreIds"] = int(genre)
         except ValueError:
-            # Otherwise look up by name in the genres collection
             genre_doc = await db.genres.find_one(
                 {"name": {"$regex": f"^{re.escape(genre)}$", "$options": "i"}},
                 {"igdbId": 1}
             )
             if genre_doc:
-                try:
-                    f["genreIds"] = int(genre_doc["igdbId"])
-                except (ValueError, TypeError):
-                    f["genreIds"] = genre_doc["igdbId"]
+                try:    f["genreIds"] = int(genre_doc["igdbId"])
+                except: f["genreIds"] = genre_doc["igdbId"]
 
     if platform and db is not None:
         try:
             f["platformIds"] = int(platform)
         except ValueError:
-            platform_doc = await db.platforms.find_one(
+            pdoc = await db.platforms.find_one(
                 {"name": {"$regex": f"^{re.escape(platform)}$", "$options": "i"}},
                 {"igdbId": 1}
             )
-            if platform_doc:
-                try:
-                    f["platformIds"] = int(platform_doc["igdbId"])
-                except (ValueError, TypeError):
-                    f["platformIds"] = platform_doc["igdbId"]
+            if pdoc:
+                try:    f["platformIds"] = int(pdoc["igdbId"])
+                except: f["platformIds"] = pdoc["igdbId"]
 
     if theme and db is not None:
         try:
             f["themeIds"] = int(theme)
         except ValueError:
-            theme_doc = await db.themes.find_one(
+            tdoc = await db.themes.find_one(
                 {"name": {"$regex": f"^{re.escape(theme)}$", "$options": "i"}},
                 {"igdbId": 1}
             )
-            if theme_doc:
-                try:
-                    f["themeIds"] = int(theme_doc["igdbId"])
-                except (ValueError, TypeError):
-                    f["themeIds"] = theme_doc["igdbId"]
+            if tdoc:
+                try:    f["themeIds"] = int(tdoc["igdbId"])
+                except: f["themeIds"] = tdoc["igdbId"]
 
     return f
 
 
 # ---------------------------------------------------------------------------
-# Game list + search
+# List games
 # ---------------------------------------------------------------------------
 
 @router.get("/")
 async def list_games(
-    q:        str | None = Query(None, description="Search by name"),
-    genre:    str | None = Query(None, description="Filter by genre ID"),
-    platform: str | None = Query(None, description="Filter by platform ID"),
-    theme:    str | None = Query(None, description="Filter by theme ID"),
+    q:        str | None = Query(None),
+    genre:    str | None = Query(None),
+    platform: str | None = Query(None),
+    theme:    str | None = Query(None),
     sort:     str        = Query("reviewTotal", enum=["reviewTotal", "igdbRating", "igdbRatingCount", "topRated", "releaseDate", "name"]),
     skip:     int        = Query(0,  ge=0),
     limit:    int        = Query(20, ge=1, le=100),
@@ -182,33 +173,20 @@ async def list_games(
 ):
     filt = await _build_filter(q, genre, platform, theme, db)
 
-    # topRated: prioritise games reviewed on Warpstar first (reviewTotal > 0),
-    # then fall back to IGDB rating with a minimum of 20 IGDB ratings
     if sort == "topRated":
-        IGDB_MIN_RATINGS = 50
+        IGDB_MIN = 20
         pipeline = [
             {"$match": filt},
             {"$addFields": {
-                # Tier 0 = has Warpstar reviews, Tier 1 = IGDB only (meets threshold)
-                "_tier": {
-                    "$cond": [{"$gt": ["$reviewTotal", 0]}, 0, 1]
-                },
-                # Within tier 1, exclude games below the IGDB rating count threshold
+                "_tier":      {"$cond": [{"$gt": ["$reviewTotal", 0]}, 0, 1]},
                 "_igdbCount": {"$ifNull": ["$igdbRatingCount", 0]},
             }},
-            # Drop IGDB-only games that don't meet the minimum rating count
-            {"$match": {
-                "$or": [
-                    {"reviewTotal": {"$gt": 0}},
-                    {"_igdbCount": {"$gte": IGDB_MIN_RATINGS}},
-                ]
-            }},
-            {"$sort": {
-                "_tier":        1,   # Warpstar-reviewed games first
-                "reviewTotal":  -1,  # Within tier 0: most reviewed first
-                "igdbRating":   -1,  # Within tier 1: highest IGDB rating first
-            }},
-            {"$skip":  skip},
+            {"$match": {"$or": [
+                {"reviewTotal": {"$gt": 0}},
+                {"_igdbCount":  {"$gte": IGDB_MIN}},
+            ]}},
+            {"$sort": {"_tier": 1, "reviewTotal": -1, "igdbRating": -1}},
+            {"$skip": skip},
             {"$limit": limit},
         ]
         count_pipeline = [
@@ -216,39 +194,29 @@ async def list_games(
             {"$addFields": {"_igdbCount": {"$ifNull": ["$igdbRatingCount", 0]}}},
             {"$match": {"$or": [
                 {"reviewTotal": {"$gt": 0}},
-                {"_igdbCount": {"$gte": IGDB_MIN_RATINGS}},
+                {"_igdbCount":  {"$gte": IGDB_MIN}},
             ]}},
             {"$count": "total"},
         ]
-        games_cursor  = db.games.aggregate(pipeline)
-        count_cursor  = db.games.aggregate(count_pipeline)
-        games         = await games_cursor.to_list(length=limit)
-        count_result  = await count_cursor.to_list(length=1)
-        total         = count_result[0]["total"] if count_result else 0
-        maps          = await _build_lookup_maps(db)
-        return {
-            "total":   total,
-            "skip":    skip,
-            "limit":   limit,
-            "results": _resolve_games(games, maps),
-        }
+        # Run games fetch and lookup maps in parallel
+        games_coro  = db.games.aggregate(pipeline).to_list(length=limit)
+        count_coro  = db.games.aggregate(count_pipeline).to_list(length=1)
+        games, count_result, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
+        total = count_result[0]["total"] if count_result else 0
+        return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
 
     direction = 1 if sort == "name" else -1
-    cursor    = db.games.find(filt).sort(sort, direction).skip(skip).limit(limit)
-    games     = await cursor.to_list(length=limit)
-    total     = await db.games.count_documents(filt)
-    maps      = await _build_lookup_maps(db)
 
-    return {
-        "total":   total,
-        "skip":    skip,
-        "limit":   limit,
-        "results": _resolve_games(games, maps),
-    }
+    # Run find, count, and lookup maps in parallel
+    games_coro = db.games.find(filt).sort(sort, direction).skip(skip).limit(limit).to_list(length=limit)
+    count_coro = db.games.count_documents(filt)
+    games, total, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
+
+    return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
 
 
 # ---------------------------------------------------------------------------
-# Meta endpoints — must be defined BEFORE /{game_id} to avoid route conflict
+# Meta endpoints — must be before /{game_id}
 # ---------------------------------------------------------------------------
 
 @router.get("/meta/platforms")
@@ -276,36 +244,27 @@ async def get_game(game_id: str, db=Depends(get_db)):
         oid = ObjectId(game_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid game ID.")
-
     game = await db.games.find_one({"_id": oid})
     if not game:
         raise HTTPException(status_code=404, detail="Game not found.")
-
     maps = await _build_lookup_maps(db)
     return _resolve_game(game, maps)
 
 
 @router.get("/{game_id}/similar")
-async def get_similar_games(
-    game_id: str,
-    limit: int = Query(10, ge=1, le=50),
-    db=Depends(get_db),
-):
+async def get_similar_games(game_id: str, limit: int = Query(10, ge=1, le=50), db=Depends(get_db)):
     try:
         oid = ObjectId(game_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid game ID.")
-
     game = await db.games.find_one({"_id": oid}, {"similarTo": 1})
     if not game:
         raise HTTPException(status_code=404, detail="Game not found.")
-
     similar_ids = (game.get("similarTo") or [])[:limit]
     if not similar_ids:
         return []
-
-    games = await db.games.find({"_id": {"$in": similar_ids}}).to_list(length=limit)
-    maps  = await _build_lookup_maps(db)
+    games_coro = db.games.find({"_id": {"$in": similar_ids}}).to_list(length=limit)
+    games, maps = await asyncio.gather(games_coro, _build_lookup_maps(db))
     return _resolve_games(games, maps)
 
 
@@ -321,8 +280,29 @@ async def get_game_reviews(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid game ID.")
 
-    cursor  = db.reviews.find({"gameId": oid}).sort("createdAt", -1).skip(skip).limit(limit)
-    reviews = await cursor.to_list(length=limit)
-    total   = await db.reviews.count_documents({"gameId": oid})
-    enriched = await _enrich_reviews(reviews, db)
+    reviews_coro = db.reviews.find({"gameId": oid}).sort("createdAt", -1).skip(skip).limit(limit).to_list(length=limit)
+    count_coro   = db.reviews.count_documents({"gameId": oid})
+    reviews, total = await asyncio.gather(reviews_coro, count_coro)
+
+    user_ids = list({r["userId"] for r in reviews if r.get("userId")})
+    users    = await db.users.find(
+        {"_id": {"$in": user_ids}},
+        {"_id": 1, "username": 1, "preferences": 1}
+    ).to_list(length=None)
+    user_map = {
+        str(u["_id"]): {
+            "username": u.get("username", "unknown"),
+            "avatar":   u.get("preferences", {}).get("profilePicture"),
+        }
+        for u in users
+    }
+
+    enriched = []
+    for r in reviews:
+        doc = serialize_doc(r)
+        uid = str(r.get("userId", ""))
+        doc["username"] = user_map.get(uid, {}).get("username", "unknown")
+        doc["avatar"]   = user_map.get(uid, {}).get("avatar")
+        enriched.append(doc)
+
     return {"total": total, "skip": skip, "limit": limit, "results": enriched}

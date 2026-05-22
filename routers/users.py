@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
+import re
+from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
 from datetime import datetime, timezone
 
@@ -6,6 +7,7 @@ from core.database import get_db
 from core.security import get_current_user
 from core.utils import serialize_doc, serialize_docs
 from schemas.user import UserPublic, UserUpdate, FollowResponse
+
 router = APIRouter(prefix="/api/users", tags=["users"])
 
 
@@ -38,6 +40,24 @@ async def update_me(body: UserUpdate, current_user=Depends(get_current_user), db
     await db.users.update_one({"_id": current_user["_id"]}, {"$set": updates})
     updated = await db.users.find_one({"_id": current_user["_id"]})
     return _user_public(updated)
+
+
+@router.get("/search")
+async def search_users(
+    q:     str = Query(..., min_length=1),
+    limit: int = Query(10, ge=1, le=50),
+    db=Depends(get_db),
+):
+    """Search users by username or display name (partial, case-insensitive)."""
+    pattern = re.escape(q.strip())
+    cursor  = db.users.find({
+        "$or": [
+            {"username":                  {"$regex": pattern, "$options": "i"}},
+            {"preferences.displayName":   {"$regex": pattern, "$options": "i"}},
+        ]
+    }).limit(limit)
+    users = await cursor.to_list(length=limit)
+    return [_user_public(u) for u in users]
 
 
 @router.get("/{username}")
