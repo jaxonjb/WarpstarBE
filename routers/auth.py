@@ -146,7 +146,7 @@ async def google_login(body: GoogleLoginRequest, db=Depends(get_db)):
                 "preferences":   {
                     "displayName":    name,
                     "profilePicture": picture,
-                },
+                }, 
                 "createdAt": now,
             }
             result  = await db.users.insert_one(doc)
