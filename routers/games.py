@@ -174,7 +174,7 @@ async def list_games(
     filt = await _build_filter(q, genre, platform, theme, db)
 
     if sort == "topRated":
-        IGDB_MIN = 20
+        IGDB_MIN = 100
         pipeline = [
             {"$match": filt},
             {"$addFields": {
