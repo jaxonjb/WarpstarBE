@@ -13,8 +13,6 @@ router = APIRouter(prefix="/api/games", tags=["games"])
 
 # ---------------------------------------------------------------------------
 # In-memory lookup map cache
-# Lookup tables (genres, platforms etc.) rarely change so we cache them for
-# 10 minutes instead of hitting MongoDB on every request.
 # ---------------------------------------------------------------------------
 
 _LOOKUP_CACHE: dict = {}
@@ -103,19 +101,10 @@ async def _build_filter(q, genre, platform, theme, db=None) -> dict:
         esc_raw   = re.escape(raw)
         esc_ascii = re.escape(ascii_q)
 
-        # Always search nameNormalized with the ascii-stripped query —
-        # it's indexed and handles accents efficiently.
-        # Only add name search as a fallback for the original query.
-        if esc_raw == esc_ascii:
-            f["$or"] = [
-                {"nameNormalized": {"$regex": esc_ascii, "$options": "i"}},
-                {"name":           {"$regex": esc_raw,   "$options": "i"}},
-            ]
-        else:
-            f["$or"] = [
-                {"nameNormalized": {"$regex": esc_ascii, "$options": "i"}},
-                {"name":           {"$regex": esc_raw,   "$options": "i"}},
-            ]
+        f["$or"] = [
+            {"nameNormalized": {"$regex": esc_ascii, "$options": "i"}},
+            {"name":           {"$regex": esc_raw,   "$options": "i"}},
+        ]
 
     if genre and db is not None:
         try:
@@ -174,31 +163,41 @@ async def list_games(
     filt = await _build_filter(q, genre, platform, theme, db)
 
     if sort == "topRated":
-        IGDB_MIN = 100
+        IGDB_MIN        = 20    # minimum IGDB rating count for tier-1 games
+        IGDB_RATING_MIN = 7.0   # minimum IGDB rating to appear in top rated
         pipeline = [
             {"$match": filt},
             {"$addFields": {
-                "_tier":      {"$cond": [{"$gt": ["$reviewTotal", 0]}, 0, 1]},
-                "_igdbCount": {"$ifNull": ["$igdbRatingCount", 0]},
+                "_tier":       {"$cond": [{"$gt": ["$reviewTotal", 0]}, 0, 1]},
+                "_igdbCount":  {"$ifNull": ["$igdbRatingCount", 0]},
+                "_igdbRating": {"$ifNull": ["$igdbRating", 0]},
             }},
             {"$match": {"$or": [
                 {"reviewTotal": {"$gt": 0}},
-                {"_igdbCount":  {"$gte": IGDB_MIN}},
+                {"$and": [
+                    {"_igdbCount":  {"$gte": IGDB_MIN}},
+                    {"_igdbRating": {"$gte": IGDB_RATING_MIN}},
+                ]},
             ]}},
-            {"$sort": {"_tier": 1, "reviewTotal": -1, "igdbRating": -1}},
+            {"$sort": {"_tier": 1, "reviewTotal": -1, "_igdbRating": -1, "_igdbCount": -1}},
             {"$skip": skip},
             {"$limit": limit},
         ]
         count_pipeline = [
             {"$match": filt},
-            {"$addFields": {"_igdbCount": {"$ifNull": ["$igdbRatingCount", 0]}}},
+            {"$addFields": {
+                "_igdbCount":  {"$ifNull": ["$igdbRatingCount", 0]},
+                "_igdbRating": {"$ifNull": ["$igdbRating", 0]},
+            }},
             {"$match": {"$or": [
                 {"reviewTotal": {"$gt": 0}},
-                {"_igdbCount":  {"$gte": IGDB_MIN}},
+                {"$and": [
+                    {"_igdbCount":  {"$gte": IGDB_MIN}},
+                    {"_igdbRating": {"$gte": IGDB_RATING_MIN}},
+                ]},
             ]}},
             {"$count": "total"},
         ]
-        # Run games fetch and lookup maps in parallel
         games_coro  = db.games.aggregate(pipeline).to_list(length=limit)
         count_coro  = db.games.aggregate(count_pipeline).to_list(length=1)
         games, count_result, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
@@ -206,12 +205,9 @@ async def list_games(
         return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
 
     direction = 1 if sort == "name" else -1
-
-    # Run find, count, and lookup maps in parallel
     games_coro = db.games.find(filt).sort(sort, direction).skip(skip).limit(limit).to_list(length=limit)
     count_coro = db.games.count_documents(filt)
     games, total, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
-
     return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
 
 
@@ -263,7 +259,7 @@ async def get_similar_games(game_id: str, limit: int = Query(10, ge=1, le=50), d
     similar_ids = (game.get("similarTo") or [])[:limit]
     if not similar_ids:
         return []
-    games_coro = db.games.find({"_id": {"$in": similar_ids}}).to_list(length=limit)
+    games_coro = db.games.find({"_id": {"$in": similar_ids}}, {"name": 1, "coverUrl": 1}).to_list(length=limit)
     games, maps = await asyncio.gather(games_coro, _build_lookup_maps(db))
     return _resolve_games(games, maps)
 
@@ -280,7 +276,7 @@ async def get_game_reviews(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid game ID.")
 
-    reviews_coro = db.reviews.find({"gameId": oid}).sort("createdAt", -1).skip(skip).limit(limit).to_list(length=limit)
+    reviews_coro = db.reviews.find({"gameId": oid}).sort("overallScore", -1).skip(skip).limit(limit).to_list(length=limit)
     count_coro   = db.reviews.count_documents({"gameId": oid})
     reviews, total = await asyncio.gather(reviews_coro, count_coro)
 
