@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import traceback
 
-from routers import auth, feed, games, lists, reviews
+from routers import auth, feed, games, lists, reviews, recommendations, users
 
 from core.config import get_settings
 from core.database import get_client, close_db
@@ -57,7 +57,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(games.router)
-
+app.include_router(recommendations.router)
 app.include_router(reviews.router)
 app.include_router(lists.router)
 app.include_router(feed.router)

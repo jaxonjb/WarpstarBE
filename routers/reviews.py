@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
+from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from core.database import get_db
@@ -196,14 +197,80 @@ async def toggle_like(
 
 
 # ---------------------------------------------------------------------------
+# User reviews — enriched with game name + cover for profile pages
+# ---------------------------------------------------------------------------
+
+@router.get("/user/{user_id}")
+async def get_user_reviews(
+    user_id: str,
+    skip:  int = Query(0,  ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    db=Depends(get_db),
+):
+    """Returns a user's reviews enriched with game name and cover URL."""
+    try:
+        uid = ObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID.")
+
+    cursor  = db.reviews.find({"userId": uid}).sort("createdAt", -1).skip(skip).limit(limit)
+    reviews = await cursor.to_list(length=limit)
+    total   = await db.reviews.count_documents({"userId": uid})
+
+    # Fetch all referenced games in one query
+    game_ids = list({r["gameId"] for r in reviews if r.get("gameId")})
+    games    = await db.games.find(
+        {"_id": {"$in": game_ids}},
+        {"_id": 1, "name": 1, "coverUrl": 1}
+    ).to_list(length=None)
+    game_map = {str(g["_id"]): g for g in games}
+
+    enriched = []
+    for r in reviews:
+        doc     = serialize_doc(r)
+        game_id = str(r.get("gameId", ""))
+        game    = game_map.get(game_id, {})
+        doc["gameId"]       = game_id
+        doc["gameName"]     = game.get("name")
+        doc["gameCoverUrl"] = game.get("coverUrl")
+        enriched.append(doc)
+
+    return {"total": total, "skip": skip, "limit": limit, "results": enriched}
+
+
+# ---------------------------------------------------------------------------
 # Comments on a review
 # ---------------------------------------------------------------------------
+
+class CommentCreate(BaseModel):
+    content: str
+
+
+async def _enrich_comments(comments: list, db) -> list:
+    """Attach username + avatar to each comment."""
+    user_ids = list({c["userId"] for c in comments if c.get("userId")})
+    users    = await db.users.find(
+        {"_id": {"$in": user_ids}},
+        {"_id": 1, "username": 1, "preferences.profilePicture": 1}
+    ).to_list(length=None)
+    user_map = {str(u["_id"]): u for u in users}
+
+    enriched = []
+    for c in comments:
+        doc      = serialize_doc(c)
+        uid      = str(c.get("userId", ""))
+        u        = user_map.get(uid, {})
+        doc["username"] = u.get("username", "unknown")
+        doc["avatar"]   = (u.get("preferences") or {}).get("profilePicture")
+        enriched.append(doc)
+    return enriched
+
 
 @router.get("/{review_id}/comments")
 async def get_review_comments(
     review_id: str,
     skip:  int = Query(0,  ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=100),
     db=Depends(get_db),
 ):
     try:
@@ -212,13 +279,15 @@ async def get_review_comments(
         raise HTTPException(status_code=400, detail="Invalid review ID.")
     cursor   = db.comments.find({"parentId": oid, "parentType": "review"}).sort("createdAt", 1).skip(skip).limit(limit)
     comments = await cursor.to_list(length=limit)
-    return serialize_docs(comments)
+    total    = await db.comments.count_documents({"parentId": oid, "parentType": "review"})
+    enriched = await _enrich_comments(comments, db)
+    return {"total": total, "results": enriched}
 
 
 @router.post("/{review_id}/comments", status_code=201)
 async def add_review_comment(
     review_id: str,
-    content: str,
+    body: CommentCreate,
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
@@ -234,10 +303,34 @@ async def add_review_comment(
         "userId":     current_user["_id"],
         "parentId":   oid,
         "parentType": "review",
-        "content":    content,
+        "content":    body.content,
         "createdAt":  datetime.now(timezone.utc),
     }
-    result = await db.comments.insert_one(doc)
+    result   = await db.comments.insert_one(doc)
     await db.reviews.update_one({"_id": oid}, {"$inc": {"commentsCount": 1}})
-    created = await db.comments.find_one({"_id": result.inserted_id})
-    return serialize_doc(created)
+    created  = await db.comments.find_one({"_id": result.inserted_id})
+    enriched = await _enrich_comments([created], db)
+    return enriched[0]
+
+
+@router.delete("/{review_id}/comments/{comment_id}", status_code=204)
+async def delete_review_comment(
+    review_id: str,
+    comment_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    try:
+        r_oid = ObjectId(review_id)
+        c_oid = ObjectId(comment_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ID.")
+
+    comment = await db.comments.find_one({"_id": c_oid, "parentId": r_oid})
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found.")
+    if comment["userId"] != current_user["_id"]:
+        raise HTTPException(status_code=403, detail="Not your comment.")
+
+    await db.comments.delete_one({"_id": c_oid})
+    await db.reviews.update_one({"_id": r_oid}, {"$inc": {"commentsCount": -1}})
