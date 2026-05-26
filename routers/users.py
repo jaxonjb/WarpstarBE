@@ -1,7 +1,7 @@
 import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from core.database import get_db
 from core.security import get_current_user
@@ -30,12 +30,28 @@ async def update_me(body: UserUpdate, current_user=Depends(get_current_user), db
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update.")
 
-    # If username is being changed, check it's not already taken
+    # If username is being changed, enforce cooldown + uniqueness
     if "username" in updates:
         new_username = updates["username"]
+
+        # Check uniqueness
         existing = await db.users.find_one({"username": new_username, "_id": {"$ne": current_user["_id"]}})
         if existing:
             raise HTTPException(status_code=409, detail="Username already taken.")
+
+        # Check 30-day cooldown
+        last_change = current_user.get("usernameChangedAt")
+        if last_change:
+            cooldown_end = last_change + timedelta(days=30)
+            if datetime.now(timezone.utc) < cooldown_end.replace(tzinfo=timezone.utc) if last_change.tzinfo is None else cooldown_end:
+                days_left = (cooldown_end.replace(tzinfo=timezone.utc) if last_change.tzinfo is None else cooldown_end - datetime.now(timezone.utc)).days + 1
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"You can change your username again in {days_left} day{'s' if days_left != 1 else ''}."
+                )
+
+        # Record the change time
+        updates["usernameChangedAt"] = datetime.now(timezone.utc)
 
     await db.users.update_one({"_id": current_user["_id"]}, {"$set": updates})
     updated = await db.users.find_one({"_id": current_user["_id"]})

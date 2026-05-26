@@ -73,7 +73,7 @@ async def login(body: LoginRequest, db=Depends(get_db)):
     )
 
 
-@router.post("/google", response_model=TokenResponse)
+@router.post("/google")
 async def google_login(body: GoogleLoginRequest, db=Depends(get_db)):
     from google.oauth2 import id_token
     from google.auth.transport import requests as google_requests
@@ -109,25 +109,24 @@ async def google_login(body: GoogleLoginRequest, db=Depends(get_db)):
     try:
         user = await db.users.find_one({"email": email})
 
+        is_new_user = False
         if user:
-            prefs           = user.get("preferences", {})
-            current_pic     = prefs.get("profilePicture", "")
-            google_pic      = prefs.get("googleAvatar", "")
-
-            # Only update the profile picture if the user is still using their
-            # original Google photo (i.e. hasn't set a custom avatar).
-            # If they changed it during onboarding or settings, leave it alone.
-            still_using_google = (not current_pic) or (current_pic == google_pic)
-            if picture and still_using_google and current_pic != picture:
+            # Only update Google avatar if user hasn't set a custom profile picture
+            google_avatar = user.get("preferences", {}).get("googleAvatar")
+            custom_pic    = user.get("preferences", {}).get("profilePicture")
+            if picture and (custom_pic == google_avatar or not custom_pic):
                 await db.users.update_one(
                     {"_id": user["_id"]},
                     {"$set": {
-                        "preferences.profilePicture": picture,
-                        "preferences.googleAvatar":   picture,
+                        "preferences.googleAvatar":    picture,
+                        "preferences.profilePicture":  picture,
                     }},
                 )
             user_id = str(user["_id"])
+            # A user is "new" if they haven't completed onboarding yet
+            is_new_user = not user.get("onboardingComplete", False)
         else:
+            is_new_user   = True
             base_username = _slugify_username(name)
             username      = base_username
             suffix        = 1
@@ -137,25 +136,28 @@ async def google_login(body: GoogleLoginRequest, db=Depends(get_db)):
 
             now = datetime.now(timezone.utc)
             doc = {
-                "username":      username,
-                "email":         email,
-                "googleId":      google_id,
-                "favoriteGames": [],
-                "followers":     [],
-                "following":     [],
-                "preferences":   {
+                "username":           username,
+                "email":              email,
+                "googleId":           google_id,
+                "favoriteGames":      [],
+                "followers":          [],
+                "following":          [],
+                "onboardingComplete": False,
+                "preferences":        {
                     "displayName":    name,
+                    "googleAvatar":   picture,
                     "profilePicture": picture,
-                }, 
+                },
                 "createdAt": now,
             }
             result  = await db.users.insert_one(doc)
             user_id = str(result.inserted_id)
 
-        return TokenResponse(
-            access_token=create_access_token(user_id),
-            refresh_token=create_refresh_token(user_id),
-        )
+        return {
+            "access_token":  create_access_token(user_id),
+            "refresh_token": create_refresh_token(user_id),
+            "is_new_user":   is_new_user,
+        }
     except Exception as e:
         print(f"ERROR in DB operations: {type(e).__name__}: {e}")
         traceback.print_exc()

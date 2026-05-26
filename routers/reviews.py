@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
-from pydantic import BaseModel
 from datetime import datetime, timezone
+from pydantic import BaseModel
 
 from core.database import get_db
 from core.security import get_current_user
@@ -80,7 +80,8 @@ async def create_review(
         "gameId":      game_oid,
         "userId":      current_user["_id"],
         "overallScore": _calc_overall(data),
-        "likes":        0,
+        "likes":    0,
+        "dislikes": 0,
         "commentsCount": 0,
         "createdAt":    datetime.now(timezone.utc),
     }
@@ -183,17 +184,59 @@ async def toggle_like(
     if not review:
         raise HTTPException(status_code=404, detail="Review not found.")
 
-    liked_key = f"likedReviews"
-    user_liked = oid in (current_user.get(liked_key) or [])
+    user_liked    = oid in (current_user.get("likedReviews")    or [])
+    user_disliked = oid in (current_user.get("dislikedReviews") or [])
 
     if user_liked:
+        # Un-like
         await db.reviews.update_one({"_id": oid}, {"$inc": {"likes": -1}})
-        await db.users.update_one({"_id": current_user["_id"]}, {"$pull": {liked_key: oid}})
-        return {"liked": False}
+        await db.users.update_one({"_id": current_user["_id"]}, {"$pull": {"likedReviews": oid}})
+        return {"liked": False, "disliked": False}
     else:
-        await db.reviews.update_one({"_id": oid}, {"$inc": {"likes": 1}})
-        await db.users.update_one({"_id": current_user["_id"]}, {"$addToSet": {liked_key: oid}})
-        return {"liked": True}
+        updates = {"$inc": {"likes": 1}, "$set": {}}
+        user_update = {"$addToSet": {"likedReviews": oid}}
+        # If they had disliked, remove that first
+        if user_disliked:
+            updates["$inc"]["dislikes"] = -1
+            user_update["$pull"] = {"dislikedReviews": oid}
+        await db.reviews.update_one({"_id": oid}, updates)
+        await db.users.update_one({"_id": current_user["_id"]}, user_update)
+        return {"liked": True, "disliked": False}
+
+
+@router.post("/{review_id}/dislike")
+async def toggle_dislike(
+    review_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    try:
+        oid = ObjectId(review_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid review ID.")
+
+    review = await db.reviews.find_one({"_id": oid})
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found.")
+
+    user_liked    = oid in (current_user.get("likedReviews")    or [])
+    user_disliked = oid in (current_user.get("dislikedReviews") or [])
+
+    if user_disliked:
+        # Un-dislike
+        await db.reviews.update_one({"_id": oid}, {"$inc": {"dislikes": -1}})
+        await db.users.update_one({"_id": current_user["_id"]}, {"$pull": {"dislikedReviews": oid}})
+        return {"liked": False, "disliked": False}
+    else:
+        updates = {"$inc": {"dislikes": 1}}
+        user_update = {"$addToSet": {"dislikedReviews": oid}}
+        # If they had liked, remove that first
+        if user_liked:
+            updates["$inc"]["likes"] = -1
+            user_update["$pull"] = {"likedReviews": oid}
+        await db.reviews.update_one({"_id": oid}, updates)
+        await db.users.update_one({"_id": current_user["_id"]}, user_update)
+        return {"liked": False, "disliked": True}
 
 
 # ---------------------------------------------------------------------------

@@ -42,8 +42,9 @@ class UserPublic(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    username:    str | None             = Field(None, min_length=3, max_length=20, pattern=r'^[a-z0-9_]+$')
-    preferences: dict[str, Any] | None = None
+    username:           str | None             = Field(None, min_length=3, max_length=20, pattern=r'^[a-z0-9_]+$')
+    preferences:        dict[str, Any] | None = None
+    onboardingComplete: bool | None           = None
 
 
 class FollowResponse(BaseModel):
