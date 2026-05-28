@@ -123,6 +123,39 @@ async def follow_user(username: str, current_user=Depends(get_current_user), db=
     return FollowResponse(following=following, follower_count=len(updated_target.get("followers", [])))
 
 
+async def _resolve_user_ids(ids: list, db) -> list[dict]:
+    """Resolve a list of user ObjectIds into public user docs, preserving order."""
+    if not ids:
+        return []
+    cursor = db.users.find(
+        {"_id": {"$in": ids}},
+        {"_id": 1, "username": 1, "preferences": 1},
+    )
+    raw   = await cursor.to_list(length=None)
+    by_id = {u["_id"]: u for u in raw}
+    return [_user_public(by_id[oid]) for oid in ids if oid in by_id]
+
+
+@router.get("/{username}/followers")
+async def get_followers(username: str, db=Depends(get_db)):
+    """Returns the public profiles of every user following `username`, newest first."""
+    user = await db.users.find_one({"username": username})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    follower_ids = list(reversed(user.get("followers") or []))
+    return await _resolve_user_ids(follower_ids, db)
+
+
+@router.get("/{username}/following")
+async def get_following(username: str, db=Depends(get_db)):
+    """Returns the public profiles of every user `username` is following, newest first."""
+    user = await db.users.find_one({"username": username})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    following_ids = list(reversed(user.get("following") or []))
+    return await _resolve_user_ids(following_ids, db)
+
+
 # ---------------------------------------------------------------------------
 # Favorite games
 # ---------------------------------------------------------------------------

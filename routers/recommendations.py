@@ -7,8 +7,11 @@ GET /api/recommendations
     saved preferences for this request only.
 """
 
-from fastapi import APIRouter, Depends, Query
-from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Optional, Literal
+from pydantic import BaseModel
+from bson import ObjectId
+from datetime import datetime, timezone
 
 from core.database import get_db
 from core.security import get_current_user
@@ -16,6 +19,11 @@ from core.utils   import serialize_doc, serialize_docs
 from scoring      import rank_games, DEFAULT_WEIGHTS
 
 router = APIRouter(prefix="/api/recommendations", tags=["recommendations"])
+
+
+class FeedbackBody(BaseModel):
+    gameId: str
+    type:   Literal["up", "down"]
 
 
 @router.get("/")
@@ -51,8 +59,16 @@ async def get_recommendations(
     user_reviews_cursor = db.reviews.find({"userId": current_user["_id"]})
     user_reviews_raw    = await user_reviews_cursor.to_list(length=None)
 
-    # Enrich reviews with game genres + developers for familiarity boost
-    game_ids  = [r["gameId"] for r in user_reviews_raw if r.get("gameId")]
+    # Fetch user's thumbs feedback on past recommendations
+    feedback_raw = await db.recommendation_feedback.find(
+        {"userId": current_user["_id"]}
+    ).to_list(length=None)
+
+    # Combined game IDs we need genre/dev info for (reviews + feedback)
+    game_ids = list({
+        *(r["gameId"] for r in user_reviews_raw if r.get("gameId")),
+        *(f["gameId"] for f in feedback_raw     if f.get("gameId")),
+    })
     games_map: dict = {}
     if game_ids:
         games_cur = db.games.find(
@@ -70,6 +86,16 @@ async def get_recommendations(
         doc["developers"]  = g.get("developers", [])
         user_reviews.append(doc)
 
+    feedback = []
+    for f in feedback_raw:
+        g = games_map.get(f.get("gameId"), {})
+        feedback.append({
+            "gameId":     str(f.get("gameId")),
+            "type":       f.get("type"),
+            "genres":     g.get("genres", []),
+            "developers": g.get("developers", []),
+        })
+
     # Fetch candidate games
     # Strategy: pull games matching user's top genres + platforms first,
     # then fill remaining slots from highest rated games overall.
@@ -78,6 +104,10 @@ async def get_recommendations(
     user_platforms = prefs.get("platforms")   or []
 
     reviewed_game_ids = [r.get("gameId") for r in user_reviews_raw if r.get("gameId")]
+    disliked_game_ids = [f.get("gameId") for f in feedback_raw     if f.get("type") == "down" and f.get("gameId")]
+
+    # Anything we never want to surface in candidates (reviewed or thumbs-downed)
+    excluded_ids = list({*reviewed_game_ids, *disliked_game_ids})
 
     # Primary pool: genre/platform match candidates (up to 500)
     query_filters = []
@@ -87,8 +117,8 @@ async def get_recommendations(
         query_filters.append({"platforms": {"$in": user_platforms}})
 
     primary_query = {"$or": query_filters} if query_filters else {}
-    if reviewed_game_ids:
-        primary_query["_id"] = {"$nin": reviewed_game_ids}
+    if excluded_ids:
+        primary_query["_id"] = {"$nin": excluded_ids}
 
     # No projection — return all fields, identical to how games.py works
     primary_cursor = db.games.find(primary_query).sort("reviewTotal", -1).limit(500)
@@ -96,7 +126,7 @@ async def get_recommendations(
 
     # Secondary pool: top rated games not already in primary (fill to 800 total)
     primary_ids    = {g["_id"] for g in primary_games}
-    exclude_ids    = primary_ids | set(reviewed_game_ids)
+    exclude_ids    = primary_ids | set(excluded_ids)
     secondary_cursor = db.games.find(
         {"_id": {"$nin": list(exclude_ids)}}
     ).sort("reviewTotal", -1).limit(300)
@@ -112,6 +142,7 @@ async def get_recommendations(
         games        = all_games,
         user         = user_doc,
         user_reviews = user_reviews,
+        feedback     = feedback,
         weights      = overrides or None,
         limit        = limit,
     )
@@ -158,3 +189,64 @@ async def save_weights(
         {"$set": set_fields}
     )
     return {"message": "Weights saved.", "updated": updates}
+
+
+# ---------------------------------------------------------------------------
+# Thumbs up / down feedback on recommended games
+# ---------------------------------------------------------------------------
+
+@router.get("/feedback")
+async def get_feedback(
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Returns { gameId: "up" | "down" } for every game the user has rated."""
+    docs = await db.recommendation_feedback.find(
+        {"userId": current_user["_id"]}
+    ).to_list(length=None)
+    return {str(d["gameId"]): d["type"] for d in docs}
+
+
+@router.post("/feedback")
+async def set_feedback(
+    body: FeedbackBody,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Upsert thumbs up/down for a single game."""
+    try:
+        gid = ObjectId(body.gameId)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid game ID.")
+
+    now = datetime.now(timezone.utc)
+    await db.recommendation_feedback.update_one(
+        {"userId": current_user["_id"], "gameId": gid},
+        {
+            "$set":         {"type": body.type, "updatedAt": now},
+            "$setOnInsert": {
+                "userId":    current_user["_id"],
+                "gameId":    gid,
+                "createdAt": now,
+            },
+        },
+        upsert=True,
+    )
+    return {"ok": True, "gameId": body.gameId, "type": body.type}
+
+
+@router.delete("/feedback/{game_id}")
+async def clear_feedback(
+    game_id: str,
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """Remove thumbs feedback for a single game."""
+    try:
+        gid = ObjectId(game_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid game ID.")
+    await db.recommendation_feedback.delete_one(
+        {"userId": current_user["_id"], "gameId": gid}
+    )
+    return {"ok": True, "gameId": game_id}

@@ -62,3 +62,72 @@ async def get_my_activity(
         "limit":   limit,
         "results": serialize_docs(events),
     }
+
+
+@router.get("/reviews")
+async def get_following_reviews(
+    skip:  int = Query(0,  ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """
+    Returns reviews written by users the current user follows,
+    newest first. Each review is enriched with game and reviewer
+    info so the frontend doesn't need N+1 round-trips.
+    """
+    following_ids = current_user.get("following") or []
+    if not following_ids:
+        return {"total": 0, "skip": skip, "limit": limit, "results": []}
+
+    filt = {"userId": {"$in": following_ids}}
+    cursor = (
+        db.reviews.find(filt)
+        .sort("createdAt", -1)
+        .skip(skip)
+        .limit(limit)
+    )
+    reviews_raw = await cursor.to_list(length=limit)
+    total       = await db.reviews.count_documents(filt)
+
+    if not reviews_raw:
+        return {"total": total, "skip": skip, "limit": limit, "results": []}
+
+    # Batch-fetch related games + reviewer users for enrichment
+    game_ids = list({r["gameId"] for r in reviews_raw if r.get("gameId")})
+    user_ids = list({r["userId"] for r in reviews_raw if r.get("userId")})
+
+    games_map: dict = {}
+    if game_ids:
+        async for g in db.games.find(
+            {"_id": {"$in": game_ids}},
+            {"_id": 1, "name": 1, "coverUrl": 1},
+        ):
+            games_map[g["_id"]] = g
+
+    users_map: dict = {}
+    if user_ids:
+        async for u in db.users.find(
+            {"_id": {"$in": user_ids}},
+            {"_id": 1, "username": 1, "preferences": 1},
+        ):
+            users_map[u["_id"]] = u
+
+    enriched = []
+    for r in reviews_raw:
+        doc = serialize_doc(r)
+        g   = games_map.get(r.get("gameId"))
+        if g:
+            doc["gameName"]     = g.get("name")
+            doc["gameCoverUrl"] = g.get("coverUrl")
+        u = users_map.get(r.get("userId"))
+        if u:
+            prefs = u.get("preferences") or {}
+            doc["reviewer"] = {
+                "username":       u.get("username"),
+                "displayName":    prefs.get("displayName"),
+                "profilePicture": prefs.get("profilePicture"),
+            }
+        enriched.append(doc)
+
+    return {"total": total, "skip": skip, "limit": limit, "results": enriched}
