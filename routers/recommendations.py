@@ -7,6 +7,7 @@ GET /api/recommendations
     saved preferences for this request only.
 """
 
+import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import Optional, Literal
 from pydantic import BaseModel
@@ -17,13 +18,41 @@ from core.database import get_db
 from core.security import get_current_user
 from core.utils   import serialize_doc, serialize_docs
 from scoring      import rank_games, DEFAULT_WEIGHTS
+from routers.games import _build_lookup_maps, _resolve_game
 
 router = APIRouter(prefix="/api/recommendations", tags=["recommendations"])
+
+
+# Minimal projection for candidate game docs — everything scoring and the
+# resolver/UI use, nothing more. Skips description, screenshots, similarTo,
+# urls, etc., which trim ~kb per doc across hundreds of docs.
+CANDIDATE_FIELDS = {
+    "name": 1, "coverUrl": 1,
+    "genreIds": 1, "platformIds": 1, "developerIds": 1,
+    "gameplayAvg": 1, "aestheticsAvg": 1, "contentAvg": 1,
+    "polishAvg": 1, "narrativeAvg": 1, "reviewTotal": 1,
+    "igdbRating": 1, "igdbRatingCount": 1, "releaseDate": 1,
+}
+
+# Even smaller projection for history games — we only ever read genreIds
+# and developerIds off these to build the user's affinity context.
+HISTORY_FIELDS = {"_id": 1, "genreIds": 1, "developerIds": 1}
+
+PRIMARY_FETCH  = 250   # over-fetch slightly to absorb post-filter exclusions
+PRIMARY_POOL   = 200
+SECONDARY_POOL = 100
 
 
 class FeedbackBody(BaseModel):
     gameId: str
     type:   Literal["up", "down"]
+
+
+def _resolve_names(g: dict, maps: dict) -> tuple[list, list]:
+    """Resolve a game doc's genre + developer IDs to name lists."""
+    genres = [maps["genres"].get(gid)    for gid in (g.get("genreIds")     or []) if maps["genres"].get(gid)]
+    devs   = [maps["companies"].get(cid) for cid in (g.get("developerIds") or [])[:5] if maps["companies"].get(cid)]
+    return genres, devs
 
 
 @router.get("/")
@@ -55,86 +84,84 @@ async def get_recommendations(
         }.items() if v is not None
     }
 
-    # Fetch user's review history (need overallScore + gameId + genres + devs)
-    user_reviews_cursor = db.reviews.find({"userId": current_user["_id"]})
-    user_reviews_raw    = await user_reviews_cursor.to_list(length=None)
+    prefs          = current_user.get("preferences") or {}
+    user_genres    = prefs.get("topGenres") or []
+    user_platforms = prefs.get("platforms") or []
 
-    # Fetch user's thumbs feedback on past recommendations
-    feedback_raw = await db.recommendation_feedback.find(
-        {"userId": current_user["_id"]}
-    ).to_list(length=None)
+    # Primary pool match: any genre OR platform overlap. We don't $nin exclude
+    # in the query itself — pulling a few extra rows and filtering in Python
+    # lets this query run in parallel with the user-history fetches.
+    query_filters = []
+    if user_genres:
+        query_filters.append({"genres":    {"$in": user_genres}})
+    if user_platforms:
+        query_filters.append({"platforms": {"$in": user_platforms}})
+    primary_query = {"$or": query_filters} if query_filters else {}
 
-    # Combined game IDs we need genre/dev info for (reviews + feedback)
-    game_ids = list({
-        *(r["gameId"] for r in user_reviews_raw if r.get("gameId")),
-        *(f["gameId"] for f in feedback_raw     if f.get("gameId")),
-    })
-    games_map: dict = {}
-    if game_ids:
-        games_cur = db.games.find(
-            {"_id": {"$in": game_ids}},
-            {"_id": 1, "genres": 1, "developers": 1}
-        )
-        async for g in games_cur:
-            games_map[g["_id"]] = g
+    # ----- Phase 1: independent queries fire in parallel -----
+    user_reviews_raw, feedback_raw, maps, primary_raw_pool = await asyncio.gather(
+        db.reviews.find({"userId": current_user["_id"]}).to_list(length=None),
+        db.recommendation_feedback.find({"userId": current_user["_id"]}).to_list(length=None),
+        _build_lookup_maps(db),
+        db.games.find(primary_query, CANDIDATE_FIELDS)
+                .sort("reviewTotal", -1)
+                .limit(PRIMARY_FETCH)
+                .to_list(length=PRIMARY_FETCH),
+    )
 
+    # Build exclusion + history sets from the user's review/feedback history
+    reviewed_ids  = {r["gameId"] for r in user_reviews_raw if r.get("gameId")}
+    disliked_ids  = {f["gameId"] for f in feedback_raw     if f.get("type") == "down" and f.get("gameId")}
+    excluded_ids  = reviewed_ids | disliked_ids
+    history_ids   = list(reviewed_ids | {f["gameId"] for f in feedback_raw if f.get("gameId")})
+
+    # Trim the primary pool now that we know what to exclude
+    primary_games = [g for g in primary_raw_pool if g["_id"] not in excluded_ids][:PRIMARY_POOL]
+    primary_ids   = {g["_id"] for g in primary_games}
+
+    # ----- Phase 2: history lookup + secondary pool fire in parallel -----
+    secondary_excluded = list(primary_ids | excluded_ids)
+
+    async def _fetch_history():
+        if not history_ids:
+            return []
+        return await db.games.find(
+            {"_id": {"$in": history_ids}}, HISTORY_FIELDS,
+        ).to_list(length=None)
+
+    history_games, secondary_games = await asyncio.gather(
+        _fetch_history(),
+        db.games.find({"_id": {"$nin": secondary_excluded}}, CANDIDATE_FIELDS)
+                .sort("reviewTotal", -1)
+                .limit(SECONDARY_POOL)
+                .to_list(length=SECONDARY_POOL),
+    )
+
+    history_map = {g["_id"]: g for g in history_games}
+
+    # Enrich reviews with genre/dev names for the affinity model
     user_reviews = []
     for r in user_reviews_raw:
         doc = serialize_doc(r)
-        g   = games_map.get(r.get("gameId"), {})
-        doc["genres"]      = g.get("genres", [])
-        doc["developers"]  = g.get("developers", [])
+        genres, devs = _resolve_names(history_map.get(r.get("gameId"), {}), maps)
+        doc["genres"]     = genres
+        doc["developers"] = devs
         user_reviews.append(doc)
 
+    # Enrich feedback the same way
     feedback = []
     for f in feedback_raw:
-        g = games_map.get(f.get("gameId"), {})
+        genres, devs = _resolve_names(history_map.get(f.get("gameId"), {}), maps)
         feedback.append({
             "gameId":     str(f.get("gameId")),
             "type":       f.get("type"),
-            "genres":     g.get("genres", []),
-            "developers": g.get("developers", []),
+            "genres":     genres,
+            "developers": devs,
         })
 
-    # Fetch candidate games
-    # Strategy: pull games matching user's top genres + platforms first,
-    # then fill remaining slots from highest rated games overall.
-    prefs          = current_user.get("preferences") or {}
-    user_genres    = prefs.get("topGenres")   or []
-    user_platforms = prefs.get("platforms")   or []
-
-    reviewed_game_ids = [r.get("gameId") for r in user_reviews_raw if r.get("gameId")]
-    disliked_game_ids = [f.get("gameId") for f in feedback_raw     if f.get("type") == "down" and f.get("gameId")]
-
-    # Anything we never want to surface in candidates (reviewed or thumbs-downed)
-    excluded_ids = list({*reviewed_game_ids, *disliked_game_ids})
-
-    # Primary pool: genre/platform match candidates (up to 500)
-    query_filters = []
-    if user_genres:
-        query_filters.append({"genres": {"$in": user_genres}})
-    if user_platforms:
-        query_filters.append({"platforms": {"$in": user_platforms}})
-
-    primary_query = {"$or": query_filters} if query_filters else {}
-    if excluded_ids:
-        primary_query["_id"] = {"$nin": excluded_ids}
-
-    # No projection — return all fields, identical to how games.py works
-    primary_cursor = db.games.find(primary_query).sort("reviewTotal", -1).limit(500)
-    primary_games  = await primary_cursor.to_list(length=500)
-
-    # Secondary pool: top rated games not already in primary (fill to 800 total)
-    primary_ids    = {g["_id"] for g in primary_games}
-    exclude_ids    = primary_ids | set(excluded_ids)
-    secondary_cursor = db.games.find(
-        {"_id": {"$nin": list(exclude_ids)}}
-    ).sort("reviewTotal", -1).limit(300)
-    secondary_games = await secondary_cursor.to_list(length=300)
-
-    # Serialize exactly like games.py does — the name arrays (genres, platforms,
-    # developers) are already stored as strings on the game documents from import
-    all_games = [serialize_doc(g) for g in primary_games + secondary_games]
+    # Fully resolve candidates so scoring sees string arrays AND the response
+    # carries genres/platforms/developers — eliminates the frontend N+1.
+    all_games = [_resolve_game(g, maps) for g in primary_games + secondary_games]
 
     user_doc = serialize_doc(current_user)
 
