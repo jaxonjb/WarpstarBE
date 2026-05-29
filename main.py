@@ -64,6 +64,6 @@ app.include_router(feed.router)
 app.include_router(notifications.router)
 
 
-@app.get("/health", tags=["health"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["health"])
 async def health():
     return {"status": "ok"}
