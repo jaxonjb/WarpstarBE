@@ -163,45 +163,29 @@ async def list_games(
     filt = await _build_filter(q, genre, platform, theme, db)
 
     if sort == "topRated":
-        IGDB_MIN        = 20    # minimum IGDB rating count for tier-1 games
-        IGDB_RATING_MIN = 7.0   # minimum IGDB rating to appear in top rated
+        # Top rated on Warpstar: only games that have at least one review on
+        # the site. Rank by the Warpstar average (mean of the five factor
+        # averages) descending; ties go to the game with more reviews.
+        # Final _id tiebreaker keeps pagination stable across calls.
+        top_filter = {**filt, "reviewTotal": {"$gt": 0}}
         pipeline = [
-            {"$match": filt},
+            {"$match": top_filter},
             {"$addFields": {
-                "_tier":       {"$cond": [{"$gt": ["$reviewTotal", 0]}, 0, 1]},
-                "_igdbCount":  {"$ifNull": ["$igdbRatingCount", 0]},
-                "_igdbRating": {"$ifNull": ["$igdbRating", 0]},
-            }},
-            {"$match": {"$or": [
-                {"reviewTotal": {"$gt": 0}},
-                {"$and": [
-                    {"_igdbCount":  {"$gte": IGDB_MIN}},
-                    {"_igdbRating": {"$gte": IGDB_RATING_MIN}},
+                "_warpstarAvg": {"$avg": [
+                    {"$ifNull": ["$gameplayAvg",   0]},
+                    {"$ifNull": ["$aestheticsAvg", 0]},
+                    {"$ifNull": ["$contentAvg",    0]},
+                    {"$ifNull": ["$polishAvg",     0]},
+                    {"$ifNull": ["$narrativeAvg",  0]},
                 ]},
-            ]}},
-            {"$sort": {"_tier": 1, "reviewTotal": -1, "_igdbRating": -1, "_igdbCount": -1}},
+            }},
+            {"$sort": {"_warpstarAvg": -1, "reviewTotal": -1, "_id": 1}},
             {"$skip": skip},
             {"$limit": limit},
         ]
-        count_pipeline = [
-            {"$match": filt},
-            {"$addFields": {
-                "_igdbCount":  {"$ifNull": ["$igdbRatingCount", 0]},
-                "_igdbRating": {"$ifNull": ["$igdbRating", 0]},
-            }},
-            {"$match": {"$or": [
-                {"reviewTotal": {"$gt": 0}},
-                {"$and": [
-                    {"_igdbCount":  {"$gte": IGDB_MIN}},
-                    {"_igdbRating": {"$gte": IGDB_RATING_MIN}},
-                ]},
-            ]}},
-            {"$count": "total"},
-        ]
-        games_coro  = db.games.aggregate(pipeline).to_list(length=limit)
-        count_coro  = db.games.aggregate(count_pipeline).to_list(length=1)
-        games, count_result, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
-        total = count_result[0]["total"] if count_result else 0
+        games_coro = db.games.aggregate(pipeline).to_list(length=limit)
+        count_coro = db.games.count_documents(top_filter)
+        games, total, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
         return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
 
     direction = 1 if sort == "name" else -1

@@ -5,7 +5,7 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import traceback
 
-from routers import auth, feed, games, lists, reviews, recommendations, users
+from routers import auth, feed, games, lists, reviews, recommendations, users, notifications
 
 from core.config import get_settings
 from core.database import get_client, close_db
@@ -61,6 +61,7 @@ app.include_router(recommendations.router)
 app.include_router(reviews.router)
 app.include_router(lists.router)
 app.include_router(feed.router)
+app.include_router(notifications.router)
 
 
 @app.get("/health", tags=["health"])

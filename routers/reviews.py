@@ -191,6 +191,13 @@ async def toggle_like(
         # Un-like
         await db.reviews.update_one({"_id": oid}, {"$inc": {"likes": -1}})
         await db.users.update_one({"_id": current_user["_id"]}, {"$pull": {"likedReviews": oid}})
+        # Pull the matching notification so the badge doesn't lie
+        await db.notifications.delete_one({
+            "userId":   review["userId"],
+            "actorId":  current_user["_id"],
+            "type":     "review_like",
+            "reviewId": oid,
+        })
         return {"liked": False, "disliked": False}
     else:
         updates = {"$inc": {"likes": 1}, "$set": {}}
@@ -201,6 +208,16 @@ async def toggle_like(
             user_update["$pull"] = {"dislikedReviews": oid}
         await db.reviews.update_one({"_id": oid}, updates)
         await db.users.update_one({"_id": current_user["_id"]}, user_update)
+        # Notify the review author (skip if liking your own review)
+        if review["userId"] != current_user["_id"]:
+            await db.notifications.insert_one({
+                "userId":    review["userId"],
+                "actorId":   current_user["_id"],
+                "type":      "review_like",
+                "reviewId":  oid,
+                "read":      False,
+                "createdAt": datetime.now(timezone.utc),
+            })
         return {"liked": True, "disliked": False}
 
 
@@ -339,7 +356,8 @@ async def add_review_comment(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid review ID.")
 
-    if not await db.reviews.find_one({"_id": oid}):
+    review = await db.reviews.find_one({"_id": oid})
+    if not review:
         raise HTTPException(status_code=404, detail="Review not found.")
 
     doc = {
@@ -351,6 +369,19 @@ async def add_review_comment(
     }
     result   = await db.comments.insert_one(doc)
     await db.reviews.update_one({"_id": oid}, {"$inc": {"commentsCount": 1}})
+
+    # Notify the review author (skip if commenting on your own review)
+    if review["userId"] != current_user["_id"]:
+        await db.notifications.insert_one({
+            "userId":    review["userId"],
+            "actorId":   current_user["_id"],
+            "type":      "review_comment",
+            "reviewId":  oid,
+            "commentId": result.inserted_id,
+            "read":      False,
+            "createdAt": datetime.now(timezone.utc),
+        })
+
     created  = await db.comments.find_one({"_id": result.inserted_id})
     enriched = await _enrich_comments([created], db)
     return enriched[0]
@@ -377,3 +408,5 @@ async def delete_review_comment(
 
     await db.comments.delete_one({"_id": c_oid})
     await db.reviews.update_one({"_id": r_oid}, {"$inc": {"commentsCount": -1}})
+    # Clean up the related notification if it still exists
+    await db.notifications.delete_one({"commentId": c_oid, "type": "review_comment"})
