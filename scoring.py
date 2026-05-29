@@ -299,13 +299,13 @@ def _generate_reasons(
         if top_genre and top_genre.lower() in {g.lower() for g in genre_overlap}:
             reasons.append({
                 "type": "genre",
-                "text": f"A strong fit for your top genre: {top_genre}",
+                "text": f"Fits into your top genre: {top_genre}",
             })
         else:
             label = ", ".join(genre_overlap[:2])
             reasons.append({
                 "type": "genre",
-                "text": f"Matches your favourite genre{'s' if len(genre_overlap) > 1 else ''}: {label}",
+                "text": f"Matches your favorite genre{'s' if len(genre_overlap) > 1 else ''}: {label}",
             })
 
     # --- 4. Platform match
@@ -314,7 +314,7 @@ def _generate_reasons(
     if pf_overlap:
         reasons.append({
             "type": "platform",
-            "text": f"Plays on {pf_overlap[0]}, one of your platforms",
+            "text": f"Plays on one of your platforms ({pf_overlap[0]})",
         })
 
     # --- 5. Quality / reception — broken down by factor when one stands out
@@ -336,22 +336,22 @@ def _generate_reasons(
             if user_w >= 7:
                 reasons.append({
                     "type": "quality",
-                    "text": f"Excels at {s_label} ({_fmt_score(s_score)}/10) — a factor you prioritise",
+                    "text": f"Exceptional {s_label} ({_fmt_score(s_score)}/10)",
                 })
             else:
                 reasons.append({
                     "type": "quality",
-                    "text": f"Particularly strong {s_label} ({_fmt_score(s_score)}/10)",
+                    "text": f"Strong {s_label} ({_fmt_score(s_score)}/10)",
                 })
         elif avg >= 8.0:
             reasons.append({
                 "type": "quality",
-                "text": f"Highly rated across the board ({_fmt_score(avg)}/10 over {review_total} review{'s' if review_total != 1 else ''})",
+                "text": f"Exceptionally recieved: ({_fmt_score(avg)}/10 over {review_total} review{'s' if review_total != 1 else ''})",
             })
         elif avg >= 7.0:
             reasons.append({
                 "type": "quality",
-                "text": f"Well-received ({_fmt_score(avg)}/10 from {review_total} review{'s' if review_total != 1 else ''})",
+                "text": f"Well-received: ({_fmt_score(avg)}/10 from {review_total} review{'s' if review_total != 1 else ''})",
             })
 
         # Second quality reason — call out a weighted-factor alignment that
