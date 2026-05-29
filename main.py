@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
  # type: ignore[import]
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore[import]
 from fastapi.responses import JSONResponse
@@ -8,7 +8,7 @@ import traceback
 from routers import auth, feed, games, lists, reviews, recommendations, users, notifications
 
 from core.config import get_settings
-from core.database import get_client, close_db
+from core.database import get_client, close_db, get_db
 from routers import users
 
 settings = get_settings()
@@ -65,5 +65,18 @@ app.include_router(notifications.router)
 
 
 @app.api_route("/health", methods=["GET", "HEAD"], tags=["health"])
-async def health():
+async def health(db=Depends(get_db)):
+    """
+    Liveness probe used by UptimeRobot. Also issues a no-op MongoDB ping
+    as a side effect so the Atlas connection pool stays warm — without
+    this, the first real DB query after a quiet stretch pays cold-
+    connection latency even when the container itself is warm.
+
+    Always returns 200 (even if the DB ping fails) so transient Mongo
+    blips don't make UptimeRobot false-alert or Railway restart us.
+    """
+    try:
+        await db.command("ping")
+    except Exception:
+        pass
     return {"status": "ok"}
