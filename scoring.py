@@ -366,7 +366,7 @@ def _generate_reasons(
                 _, label = FACTOR_FIELDS[k]
                 reasons.append({
                     "type": "quality",
-                    "text": f"Solid {label} ({_fmt_score(score)}/10), aligned with your weights",
+                    "text": f"Solid {label} ({_fmt_score(score)}/10)",
                 })
                 break  # at most one extra quality reason
 
