@@ -20,6 +20,7 @@ Document shape (in db.notifications):
     }
 """
 
+import asyncio
 from fastapi import APIRouter, Depends, Query
 
 from core.database import get_db
@@ -96,14 +97,14 @@ async def list_notifications(
 ):
     """Returns the current user's notifications, newest first, plus an unread count."""
     filt = {"userId": current_user["_id"]}
-    cursor = (
-        db.notifications.find(filt)
-        .sort("createdAt", -1)
-        .skip(skip).limit(limit)
+
+    # Fire the three independent queries in parallel — they don't depend
+    # on each other and serial awaits were costing ~3 RTs per call.
+    raw, total, unread = await asyncio.gather(
+        db.notifications.find(filt).sort("createdAt", -1).skip(skip).limit(limit).to_list(length=limit),
+        db.notifications.count_documents(filt),
+        db.notifications.count_documents({**filt, "read": False}),
     )
-    raw    = await cursor.to_list(length=limit)
-    total  = await db.notifications.count_documents(filt)
-    unread = await db.notifications.count_documents({**filt, "read": False})
 
     return {
         "total":   total,
@@ -112,6 +113,23 @@ async def list_notifications(
         "limit":   limit,
         "results": await _enrich(raw, db),
     }
+
+
+@router.get("/unread-count")
+async def get_unread_count(
+    current_user=Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """
+    Lightweight endpoint for the bell badge — a single count_documents
+    with no enrichment. Polled frequently from the header, so it needs
+    to stay cheap.
+    """
+    unread = await db.notifications.count_documents({
+        "userId": current_user["_id"],
+        "read":   False,
+    })
+    return {"unread": unread}
 
 
 @router.post("/mark-read")
