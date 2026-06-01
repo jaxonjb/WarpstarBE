@@ -88,6 +88,13 @@ async def get_recommendations(
     user_genres    = prefs.get("topGenres") or []
     user_platforms = prefs.get("platforms") or []
 
+    # Resolve the user's following list to ObjectIds for DB queries
+    following_raw = current_user.get("following") or []
+    following_ids = [
+        ObjectId(fid) if not isinstance(fid, ObjectId) else fid
+        for fid in following_raw if fid
+    ]
+
     # Primary pool match: any genre OR platform overlap. We don't $nin exclude
     # in the query itself — pulling a few extra rows and filtering in Python
     # lets this query run in parallel with the user-history fetches.
@@ -99,7 +106,17 @@ async def get_recommendations(
     primary_query = {"$or": query_filters} if query_filters else {}
 
     # ----- Phase 1: independent queries fire in parallel -----
-    user_reviews_raw, feedback_raw, maps, primary_raw_pool = await asyncio.gather(
+    # social_reviews_raw: reviews by followed users (only high scores matter for the boost,
+    # but we fetch all and filter in Python so the query stays index-friendly).
+    async def _fetch_social_reviews():
+        if not following_ids:
+            return []
+        return await db.reviews.find(
+            {"userId": {"$in": following_ids}},
+            {"gameId": 1, "overallScore": 1},
+        ).to_list(length=None)
+
+    user_reviews_raw, feedback_raw, maps, primary_raw_pool, social_reviews_raw = await asyncio.gather(
         db.reviews.find({"userId": current_user["_id"]}).to_list(length=None),
         db.recommendation_feedback.find({"userId": current_user["_id"]}).to_list(length=None),
         _build_lookup_maps(db),
@@ -107,7 +124,16 @@ async def get_recommendations(
                 .sort("reviewTotal", -1)
                 .limit(PRIMARY_FETCH)
                 .to_list(length=PRIMARY_FETCH),
+        _fetch_social_reviews(),
     )
+
+    # Build social_game_scores: gameId (str) -> list of overallScores from followed users
+    social_game_scores: dict[str, list[float]] = {}
+    for r in social_reviews_raw:
+        gid   = str(r.get("gameId") or "")
+        score = r.get("overallScore")
+        if gid and score is not None:
+            social_game_scores.setdefault(gid, []).append(float(score))
 
     # Build exclusion + history sets from the user's review/feedback history
     reviewed_ids  = {r["gameId"] for r in user_reviews_raw if r.get("gameId")}
@@ -166,12 +192,13 @@ async def get_recommendations(
     user_doc = serialize_doc(current_user)
 
     ranked = rank_games(
-        games        = all_games,
-        user         = user_doc,
-        user_reviews = user_reviews,
-        feedback     = feedback,
-        weights      = overrides or None,
-        limit        = limit,
+        games               = all_games,
+        user                = user_doc,
+        user_reviews        = user_reviews,
+        feedback            = feedback,
+        weights             = overrides or None,
+        social_game_scores  = social_game_scores,
+        limit               = limit,
     )
 
     return {

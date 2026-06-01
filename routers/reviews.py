@@ -101,6 +101,61 @@ async def create_review(
     return serialize_doc(created)
 
 
+@router.get("/recent")
+async def get_recent_reviews(
+    limit: int = Query(10, ge=1, le=50),
+    db=Depends(get_db),
+):
+    """
+    Returns the most recently posted reviews across the whole site,
+    newest first. Public (no auth) so it can power the homepage.
+    Each review is enriched with game + reviewer info to avoid N+1
+    round-trips on the frontend.
+    """
+    cursor = db.reviews.find().sort("createdAt", -1).limit(limit)
+    reviews_raw = await cursor.to_list(length=limit)
+    if not reviews_raw:
+        return {"results": []}
+
+    game_ids = list({r["gameId"] for r in reviews_raw if r.get("gameId")})
+    user_ids = list({r["userId"] for r in reviews_raw if r.get("userId")})
+
+    games_map: dict = {}
+    if game_ids:
+        async for g in db.games.find(
+            {"_id": {"$in": game_ids}},
+            {"_id": 1, "name": 1, "coverUrl": 1},
+        ):
+            games_map[g["_id"]] = g
+
+    users_map: dict = {}
+    if user_ids:
+        async for u in db.users.find(
+            {"_id": {"$in": user_ids}},
+            {"_id": 1, "username": 1, "preferences": 1},
+        ):
+            users_map[u["_id"]] = u
+
+    enriched = []
+    for r in reviews_raw:
+        doc = serialize_doc(r)
+        g   = games_map.get(r.get("gameId"))
+        if g:
+            doc["gameName"]     = g.get("name")
+            doc["gameCoverUrl"] = g.get("coverUrl")
+        u = users_map.get(r.get("userId"))
+        if u:
+            prefs = u.get("preferences") or {}
+            doc["reviewer"] = {
+                "username":       u.get("username"),
+                "displayName":    prefs.get("displayName"),
+                "profilePicture": prefs.get("profilePicture"),
+            }
+        enriched.append(doc)
+
+    return {"results": enriched}
+
+
 @router.get("/{review_id}")
 async def get_review(review_id: str, db=Depends(get_db)):
     try:

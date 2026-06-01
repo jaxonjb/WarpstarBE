@@ -8,9 +8,10 @@ Each candidate game is scored 0–100 by combining:
   2. Genre match             — overlap with user's top genres
   3. Platform match          — game supports at least one of user's platforms
   4. Recency                 — newer releases score higher
-  5. Familiarity boost       — from developers/genres the user has rated well
-  6. Feedback signal         — boost/penalty from explicit thumbs up/down
-  7. Already seen penalty    — reviewed, favorited, or thumbs-downed games are suppressed
+  5. History affinity        — boost for genres/devs rated well, penalty for those rated poorly
+  6. Social boost            — boost if people the user follows rated the game highly
+  7. Feedback signal         — boost/penalty from explicit thumbs up/down
+  8. Already seen penalty    — reviewed, favorited, or thumbs-downed games are suppressed
 
 Default weights are all 5 (neutral, 0–10 scale). The algorithm normalises
 weights internally so only relative values matter.
@@ -106,34 +107,62 @@ def _factor_score(game: dict[str, Any], norm_weights: dict[str, float]) -> float
     return score / 10.0  # normalise to 0–1
 
 
-def _familiarity_boost(
+def _history_affinity(
     game: dict[str, Any],
     user_genre_scores: dict[str, float],   # genre -> avg score user gave games in that genre
     user_dev_scores:   dict[str, float],   # developer -> avg score user gave their games
 ) -> float:
     """
-    0–1 boost if the game shares genres/developers the user has historically
-    rated well (avg > 7). Soft boost — adds up to ~0.15 to the final score.
+    Boost or penalty based on genres/developers the user has historically rated.
+    Positive when the user has rated similar content well (avg >= 7).
+    Negative when the user has consistently rated similar content poorly (avg <= 4).
+    Bounded between -0.10 and +0.15.
     """
-    boost = 0.0
+    affinity = 0.0
 
     genres = [g.lower() for g in (game.get("genres") or [])]
     for genre in genres:
         avg = user_genre_scores.get(genre, 0)
         if avg >= 8.0:
-            boost += 0.06
+            affinity += 0.06
         elif avg >= 7.0:
-            boost += 0.03
+            affinity += 0.03
+        elif 0 < avg <= 3.0:
+            affinity -= 0.06
+        elif 0 < avg <= 4.0:
+            affinity -= 0.03
 
     devs = [d.lower() for d in (game.get("developers") or [])]
     for dev in devs:
         avg = user_dev_scores.get(dev, 0)
         if avg >= 8.0:
-            boost += 0.05
+            affinity += 0.05
         elif avg >= 7.0:
-            boost += 0.02
+            affinity += 0.02
+        elif 0 < avg <= 3.0:
+            affinity -= 0.05
+        elif 0 < avg <= 4.0:
+            affinity -= 0.02
 
-    return min(boost, 0.15)
+    return max(min(affinity, 0.15), -0.10)
+
+
+def _social_boost(
+    game: dict[str, Any],
+    social_game_scores: dict[str, list[float]],  # gameId -> scores from followed users
+) -> float:
+    """
+    Small boost if people the user follows have rated this game highly (>= 7.5).
+    +0.04 per followed-user high rating, capped at +0.12.
+    """
+    game_id = str(game.get("id") or game.get("_id") or "")
+    scores = social_game_scores.get(game_id, [])
+    if not scores:
+        return 0.0
+    high_scores = [s for s in scores if s >= 7.5]
+    if not high_scores:
+        return 0.0
+    return min(len(high_scores) * 0.04, 0.12)
 
 
 def _feedback_signal(
@@ -213,11 +242,12 @@ def _fmt_score(s: float) -> str:
 
 
 def _generate_reasons(
-    game:            dict[str, Any],
-    user:            dict[str, Any],
-    user_context:    dict[str, Any],
-    liked_genres:    set[str],
-    liked_devs:      set[str],
+    game:               dict[str, Any],
+    user:               dict[str, Any],
+    user_context:       dict[str, Any],
+    liked_genres:       set[str],
+    liked_devs:         set[str],
+    social_game_scores: dict[str, list[float]] | None = None,
 ) -> list[dict[str, str]]:
     """
     Build a list of human-readable reasons explaining why this game was
@@ -252,7 +282,25 @@ def _generate_reasons(
             "text": f"Similar to games you've thumbed up ({liked_genre_overlap[0]})",
         })
 
-    # --- 2. Review-history affinity (developer / genre)
+    # --- 2. Social signal — followed users' reviews
+    if social_game_scores:
+        game_id = str(game.get("id") or game.get("_id") or "")
+        social_scores = social_game_scores.get(game_id, [])
+        high_social   = [s for s in social_scores if s >= 7.5]
+        if high_social:
+            count = len(high_social)
+            if count == 1:
+                reasons.append({
+                    "type": "social",
+                    "text": "Highly rated by someone you follow",
+                })
+            else:
+                reasons.append({
+                    "type": "social",
+                    "text": f"Highly rated by {count} people you follow",
+                })
+
+    # --- 3. Review-history affinity (developer / genre)
     dev_scores   = user_context.get("dev_scores",   {})
     genre_scores = user_context.get("genre_scores", {})
 
@@ -405,34 +453,36 @@ def _generate_reasons(
 # ---------------------------------------------------------------------------
 
 def score_game(
-    game:            dict[str, Any],
-    user:            dict[str, Any],
-    user_context:    dict[str, Any],
-    weights:         dict[str, float] | None = None,
-    reviewed_ids:    set[str]               = set(),
-    favorited_ids:   set[str]               = set(),
-    disliked_ids:    set[str]               = set(),
-    liked_genres:    set[str]               = set(),
-    liked_devs:      set[str]               = set(),
-    disliked_genres: set[str]               = set(),
-    disliked_devs:   set[str]               = set(),
+    game:               dict[str, Any],
+    user:               dict[str, Any],
+    user_context:       dict[str, Any],
+    weights:            dict[str, float] | None     = None,
+    reviewed_ids:       set[str]                    = set(),
+    favorited_ids:      set[str]                    = set(),
+    disliked_ids:       set[str]                    = set(),
+    liked_genres:       set[str]                    = set(),
+    liked_devs:         set[str]                    = set(),
+    disliked_genres:    set[str]                    = set(),
+    disliked_devs:      set[str]                    = set(),
+    social_game_scores: dict[str, list[float]]      = {},
 ) -> float:
     """
     Score a single game for a user. Returns 0.0–100.0.
 
     Parameters
     ----------
-    game            : MongoDB game document (serialised to dict)
-    user            : MongoDB user document (serialised to dict)
-    user_context    : output of build_user_context()
-    weights         : 0–10 per-key weights; falls back to user prefs then defaults
-    reviewed_ids    : set of game IDs the user has already reviewed
-    favorited_ids   : set of game IDs the user has favorited
-    disliked_ids    : set of game IDs the user has thumbs-downed
-    liked_genres    : set of genres (lowercased) the user has thumbs-upped
-    liked_devs      : set of developers (lowercased) the user has thumbs-upped
-    disliked_genres : set of genres (lowercased) the user has thumbs-downed
-    disliked_devs   : set of developers (lowercased) the user has thumbs-downed
+    game               : MongoDB game document (serialised to dict)
+    user               : MongoDB user document (serialised to dict)
+    user_context       : output of build_user_context()
+    weights            : 0–10 per-key weights; falls back to user prefs then defaults
+    reviewed_ids       : set of game IDs the user has already reviewed
+    favorited_ids      : set of game IDs the user has favorited
+    disliked_ids       : set of game IDs the user has thumbs-downed
+    liked_genres       : set of genres (lowercased) the user has thumbs-upped
+    liked_devs         : set of developers (lowercased) the user has thumbs-upped
+    disliked_genres    : set of genres (lowercased) the user has thumbs-downed
+    disliked_devs      : set of developers (lowercased) the user has thumbs-downed
+    social_game_scores : gameId -> list of overallScores from followed users
     """
     game_id = str(game.get("id") or game.get("_id") or "")
 
@@ -483,33 +533,36 @@ def score_game(
 
     raw = FACTOR_WEIGHT * f_score + SIGNAL_WEIGHT * signal_score
 
-    # 5. Familiarity boost (additive, capped at +0.15)
-    boost = _familiarity_boost(
+    # 5. History affinity (additive, -0.10 to +0.15)
+    boost = _history_affinity(
         game,
         user_context.get("genre_scores", {}),
         user_context.get("dev_scores",   {}),
     )
 
-    # 6. Explicit feedback signal (additive, -0.25 to +0.15)
+    # 6. Social boost — followed users' high ratings (additive, 0 to +0.12)
+    social = _social_boost(game, social_game_scores)
+
+    # 7. Explicit feedback signal (additive, -0.25 to +0.15)
     fsig = _feedback_signal(
         game,
         liked_genres, liked_devs,
         disliked_genres, disliked_devs,
     )
 
-    # 7. Quality floor — penalise very low scored games
+    # 8. Quality floor — penalise very low scored games
     review_total = game.get("reviewTotal") or 0
     if has_warpstar and f_score < 0.4:   # avg < 4.0 on Warpstar
         raw *= 0.5
     elif not has_warpstar and (game.get("igdbRating") or 0) < 40:
         raw *= 0.7
 
-    # 8. Confidence boost for games with more reviews (log scale)
+    # 9. Confidence boost for games with more reviews (log scale)
     if review_total > 1:
         confidence = min(math.log10(review_total) / 2.0, 0.1)
         raw += confidence
 
-    final = max(min((raw + boost + fsig) * 100, 100.0), 0.0)
+    final = max(min((raw + boost + social + fsig) * 100, 100.0), 0.0)
     return round(final, 2)
 
 
@@ -518,24 +571,28 @@ def score_game(
 # ---------------------------------------------------------------------------
 
 def rank_games(
-    games:          list[dict[str, Any]],
-    user:           dict[str, Any],
-    user_reviews:   list[dict[str, Any]],
-    feedback:       list[dict[str, Any]] | None = None,
-    weights:        dict[str, float] | None = None,
-    limit:          int = 20,
+    games:              list[dict[str, Any]],
+    user:               dict[str, Any],
+    user_reviews:       list[dict[str, Any]],
+    feedback:           list[dict[str, Any]] | None     = None,
+    weights:            dict[str, float] | None         = None,
+    social_game_scores: dict[str, list[float]] | None   = None,
+    limit:              int                             = 20,
 ) -> list[dict[str, Any]]:
     """
     Score and rank a list of games for a user.
     Returns the top `limit` games sorted by score descending,
     with a `_score` field added to each game dict.
 
-    feedback: list of {gameId, type ("up"|"down"), genres, developers}
-              from the user's thumbs feedback on prior recommendations.
+    feedback           : list of {gameId, type ("up"|"down"), genres, developers}
+                         from the user's thumbs feedback on prior recommendations.
+    social_game_scores : gameId -> list of overallScores from followed users.
+                         Games rated highly by followed users receive a small boost.
     """
-    reviewed_ids  = {str(r.get("gameId") or "") for r in user_reviews}
-    favorited_ids = {str(f) for f in (user.get("favoriteGames") or [])}
-    user_context  = build_user_context(user_reviews)
+    reviewed_ids        = {str(r.get("gameId") or "") for r in user_reviews}
+    favorited_ids       = {str(f) for f in (user.get("favoriteGames") or [])}
+    user_context        = build_user_context(user_reviews)
+    social_scores       = social_game_scores or {}
 
     # Derive sets from explicit feedback
     feedback = feedback or []
@@ -558,17 +615,18 @@ def rank_games(
     scored = []
     for game in games:
         s = score_game(
-            game            = game,
-            user            = user,
-            user_context    = user_context,
-            weights         = weights,
-            reviewed_ids    = reviewed_ids,
-            favorited_ids   = favorited_ids,
-            disliked_ids    = disliked_ids,
-            liked_genres    = liked_genres,
-            liked_devs      = liked_devs,
-            disliked_genres = disliked_genres,
-            disliked_devs   = disliked_devs,
+            game               = game,
+            user               = user,
+            user_context       = user_context,
+            weights            = weights,
+            reviewed_ids       = reviewed_ids,
+            favorited_ids      = favorited_ids,
+            disliked_ids       = disliked_ids,
+            liked_genres       = liked_genres,
+            liked_devs         = liked_devs,
+            disliked_genres    = disliked_genres,
+            disliked_devs      = disliked_devs,
+            social_game_scores = social_scores,
         )
         if s > 0:
             scored.append({**game, "_score": s})
@@ -579,11 +637,12 @@ def rank_games(
     # Attach reasons only to the games we'll actually return
     for g in top:
         g["_reasons"] = _generate_reasons(
-            game         = g,
-            user         = user,
-            user_context = user_context,
-            liked_genres = liked_genres,
-            liked_devs   = liked_devs,
+            game               = g,
+            user               = user,
+            user_context       = user_context,
+            liked_genres       = liked_genres,
+            liked_devs         = liked_devs,
+            social_game_scores = social_scores,
         )
 
     return top
