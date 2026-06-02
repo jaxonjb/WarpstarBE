@@ -8,6 +8,18 @@ from core.utils import serialize_doc, serialize_docs
 
 router = APIRouter(prefix="/api/feed", tags=["feed"])
 
+# Maps the frontend `sort` query value to a MongoDB sort field. Every option
+# sorts descending; a stable `_id` tiebreaker keeps pagination consistent.
+REVIEW_SORTS = {
+    "recent":     "createdAt",
+    "overall":    "overallScore",
+    "gameplay":   "gameplay",
+    "content":    "content",
+    "narrative":  "narrative",
+    "aesthetics": "aesthetics",
+    "polish":     "polish",
+}
+
 
 @router.get("/")
 async def get_feed(
@@ -66,24 +78,30 @@ async def get_my_activity(
 
 @router.get("/reviews")
 async def get_following_reviews(
-    skip:  int = Query(0,  ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    skip:      int = Query(0,  ge=0),
+    limit:     int = Query(20, ge=1, le=100),
+    sort:      str = Query("recent"),
+    direction: str = Query("desc"),
     current_user=Depends(get_current_user),
     db=Depends(get_db),
 ):
     """
-    Returns reviews written by users the current user follows,
-    newest first. Each review is enriched with game and reviewer
+    Returns reviews written by users the current user follows.
+    Sort field is controlled by `sort` (see REVIEW_SORTS) and order by
+    `direction` (asc/desc). Each review is enriched with game and reviewer
     info so the frontend doesn't need N+1 round-trips.
     """
     following_ids = current_user.get("following") or []
     if not following_ids:
         return {"total": 0, "skip": skip, "limit": limit, "results": []}
 
+    sort_field = REVIEW_SORTS.get(sort, "createdAt")
+    sort_dir   = 1 if direction == "asc" else -1
+
     filt = {"userId": {"$in": following_ids}}
     cursor = (
         db.reviews.find(filt)
-        .sort("createdAt", -1)
+        .sort([(sort_field, sort_dir), ("_id", -1)])
         .skip(skip)
         .limit(limit)
     )

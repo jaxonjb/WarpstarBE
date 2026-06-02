@@ -149,23 +149,33 @@ async def _build_filter(q, genre, platform, theme, db=None) -> dict:
 # List games
 # ---------------------------------------------------------------------------
 
+# Warpstar per-factor average fields. Sorting by these only makes sense for
+# games that actually have reviews, so they get a reviewTotal > 0 filter.
+CATEGORY_SORTS = {"gameplayAvg", "contentAvg", "narrativeAvg", "aestheticsAvg", "polishAvg"}
+
+
 @router.get("/")
 async def list_games(
-    q:        str | None = Query(None),
-    genre:    str | None = Query(None),
-    platform: str | None = Query(None),
-    theme:    str | None = Query(None),
-    sort:     str        = Query("reviewTotal", enum=["reviewTotal", "igdbRating", "igdbRatingCount", "topRated", "releaseDate", "name"]),
-    skip:     int        = Query(0,  ge=0),
-    limit:    int        = Query(20, ge=1, le=100),
+    q:         str | None = Query(None),
+    genre:     str | None = Query(None),
+    platform:  str | None = Query(None),
+    theme:     str | None = Query(None),
+    sort:      str        = Query("reviewTotal", enum=[
+        "reviewTotal", "igdbRating", "igdbRatingCount", "topRated", "releaseDate", "name",
+        "gameplayAvg", "contentAvg", "narrativeAvg", "aestheticsAvg", "polishAvg",
+    ]),
+    direction: str        = Query("desc", enum=["asc", "desc"]),
+    skip:      int        = Query(0,  ge=0),
+    limit:     int        = Query(20, ge=1, le=100),
     db=Depends(get_db),
 ):
-    filt = await _build_filter(q, genre, platform, theme, db)
+    filt    = await _build_filter(q, genre, platform, theme, db)
+    dir_val = 1 if direction == "asc" else -1
 
     if sort == "topRated":
         # Top rated on Warpstar: only games that have at least one review on
         # the site. Rank by the Warpstar average (mean of the five factor
-        # averages) descending; ties go to the game with more reviews.
+        # averages); ties go to the game with more reviews.
         # Final _id tiebreaker keeps pagination stable across calls.
         top_filter = {**filt, "reviewTotal": {"$gt": 0}}
         pipeline = [
@@ -179,7 +189,7 @@ async def list_games(
                     {"$ifNull": ["$narrativeAvg",  0]},
                 ]},
             }},
-            {"$sort": {"_warpstarAvg": -1, "reviewTotal": -1, "_id": 1}},
+            {"$sort": {"_warpstarAvg": dir_val, "reviewTotal": -1, "_id": 1}},
             {"$skip": skip},
             {"$limit": limit},
         ]
@@ -188,8 +198,16 @@ async def list_games(
         games, total, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
         return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
 
-    direction = 1 if sort == "name" else -1
-    games_coro = db.games.find(filt).sort(sort, direction).skip(skip).limit(limit).to_list(length=limit)
+    if sort in CATEGORY_SORTS:
+        # Only rank games that have reviews — unreviewed games have a 0 average
+        # and would otherwise flood the results.
+        filt = {**filt, "reviewTotal": {"$gt": 0}}
+        games_coro = db.games.find(filt).sort([(sort, dir_val), ("_id", 1)]).skip(skip).limit(limit).to_list(length=limit)
+        count_coro = db.games.count_documents(filt)
+        games, total, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
+        return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
+
+    games_coro = db.games.find(filt).sort(sort, dir_val).skip(skip).limit(limit).to_list(length=limit)
     count_coro = db.games.count_documents(filt)
     games, total, maps = await asyncio.gather(games_coro, count_coro, _build_lookup_maps(db))
     return {"total": total, "skip": skip, "limit": limit, "results": _resolve_games(games, maps)}
@@ -231,21 +249,62 @@ async def get_game(game_id: str, db=Depends(get_db)):
     return _resolve_game(game, maps)
 
 
+# Fields used for similarity ranking — per-factor Warpstar averages.
+_SIMILAR_FACTORS = ["gameplayAvg", "contentAvg", "narrativeAvg", "aestheticsAvg", "polishAvg"]
+# Max possible Euclidean distance across 5 factors each on a 0–10 scale.
+_SIMILAR_MAX_DIST = (5 * 100) ** 0.5
+_SIMILAR_PROJ = {
+    "name": 1, "coverUrl": 1, "genreIds": 1, "reviewTotal": 1,
+    "gameplayAvg": 1, "contentAvg": 1, "narrativeAvg": 1,
+    "aestheticsAvg": 1, "polishAvg": 1,
+}
+
+
 @router.get("/{game_id}/similar")
 async def get_similar_games(game_id: str, limit: int = Query(10, ge=1, le=50), db=Depends(get_db)):
+    """
+    Finds the games most similar to this one by comparing per-category Warpstar
+    score averages and genre overlap. Only games that have been reviewed are
+    considered, and a game with no Warpstar reviews gets no suggestions at all.
+    """
     try:
         oid = ObjectId(game_id)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid game ID.")
-    game = await db.games.find_one({"_id": oid}, {"similarTo": 1})
+
+    game = await db.games.find_one({"_id": oid}, _SIMILAR_PROJ)
     if not game:
         raise HTTPException(status_code=404, detail="Game not found.")
-    similar_ids = (game.get("similarTo") or [])[:limit]
-    if not similar_ids:
+
+    # No reviews on this game → no basis for comparison, so no similar games.
+    if not game.get("reviewTotal", 0):
         return []
-    games_coro = db.games.find({"_id": {"$in": similar_ids}}, {"name": 1, "coverUrl": 1}).to_list(length=limit)
-    games, maps = await asyncio.gather(games_coro, _build_lookup_maps(db))
-    return _resolve_games(games, maps)
+
+    target_scores = [float(game.get(f) or 0) for f in _SIMILAR_FACTORS]
+    target_genres = set(game.get("genreIds") or [])
+
+    # Candidate pool: every other game that has at least one review.
+    candidates = await db.games.find(
+        {"_id": {"$ne": oid}, "reviewTotal": {"$gt": 0}},
+        _SIMILAR_PROJ,
+    ).to_list(length=None)
+    if not candidates:
+        return []
+
+    def similarity(c: dict) -> float:
+        # Category similarity: 1 minus the normalised Euclidean distance.
+        cs   = [float(c.get(f) or 0) for f in _SIMILAR_FACTORS]
+        dist = sum((a - b) ** 2 for a, b in zip(target_scores, cs)) ** 0.5
+        cat_sim = 1 - (dist / _SIMILAR_MAX_DIST)
+        # Genre similarity: Jaccard overlap of genre IDs.
+        cg        = set(c.get("genreIds") or [])
+        union     = target_genres | cg
+        genre_sim = (len(target_genres & cg) / len(union)) if union else 0.0
+        return 0.5 * cat_sim + 0.5 * genre_sim
+
+    ranked = sorted(candidates, key=similarity, reverse=True)[:limit]
+    maps   = await _build_lookup_maps(db)
+    return _resolve_games(ranked, maps)
 
 
 @router.get("/{game_id}/reviews")

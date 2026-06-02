@@ -10,6 +10,18 @@ from schemas.review import ReviewCreate, ReviewUpdate
 
 router = APIRouter(prefix="/api/reviews", tags=["reviews"])
 
+# Maps a frontend `sort` value to a review document field. Mirrors the map in
+# routers/feed.py so the following feed and profile use the same options.
+REVIEW_SORTS = {
+    "recent":     "createdAt",
+    "overall":    "overallScore",
+    "gameplay":   "gameplay",
+    "content":    "content",
+    "narrative":  "narrative",
+    "aesthetics": "aesthetics",
+    "polish":     "polish",
+}
+
 
 def _calc_overall(data: dict) -> float:
     fields = ["gameplay", "content", "narrative", "aesthetics", "polish"]
@@ -318,8 +330,10 @@ async def toggle_dislike(
 @router.get("/user/{user_id}")
 async def get_user_reviews(
     user_id: str,
-    skip:  int = Query(0,  ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    skip:      int = Query(0,  ge=0),
+    limit:     int = Query(20, ge=1, le=100),
+    sort:      str = Query("recent"),
+    direction: str = Query("desc"),
     db=Depends(get_db),
 ):
     """Returns a user's reviews enriched with game name and cover URL."""
@@ -328,7 +342,10 @@ async def get_user_reviews(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid user ID.")
 
-    cursor  = db.reviews.find({"userId": uid}).sort("createdAt", -1).skip(skip).limit(limit)
+    sort_field = REVIEW_SORTS.get(sort, "createdAt")
+    sort_dir   = 1 if direction == "asc" else -1
+
+    cursor  = db.reviews.find({"userId": uid}).sort([(sort_field, sort_dir), ("_id", -1)]).skip(skip).limit(limit)
     reviews = await cursor.to_list(length=limit)
     total   = await db.reviews.count_documents({"userId": uid})
 
