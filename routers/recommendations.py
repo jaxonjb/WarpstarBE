@@ -237,11 +237,23 @@ async def save_weights(
     if not updates:
         return {"message": "No weights provided."}
 
-    set_fields = {f"preferences.weights.{k}": v for k, v in updates.items()}
-    await db.users.update_one(
-        {"_id": current_user["_id"]},
-        {"$set": set_fields}
-    )
+    # Legacy accounts may have `preferences` as null or missing. A dotted
+    # `$set` on preferences.weights.* throws a path-traversal error in that
+    # case, so merge against whatever exists and write a level that's safe
+    # regardless of the current shape.
+    prefs = current_user.get("preferences")
+    existing = prefs.get("weights") if isinstance(prefs, dict) and isinstance(prefs.get("weights"), dict) else {}
+    merged   = {**existing, **updates}
+
+    if isinstance(prefs, dict):
+        # preferences is a real object — set just the weights subdocument so
+        # sibling preference fields are preserved.
+        update = {"$set": {"preferences.weights": merged}}
+    else:
+        # preferences is null/missing — replace it with a fresh object.
+        update = {"$set": {"preferences": {"weights": merged}}}
+
+    await db.users.update_one({"_id": current_user["_id"]}, update)
     return {"message": "Weights saved.", "updated": updates}
 
 
