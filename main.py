@@ -1,7 +1,8 @@
 from fastapi import FastAPI, Request, Depends
  # type: ignore[import]
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore[import]
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from xml.sax.saxutils import escape
 from contextlib import asynccontextmanager
 import traceback
 
@@ -80,3 +81,38 @@ async def health(db=Depends(get_db)):
     except Exception:
         pass
     return {"status": "ok"}
+
+
+# Public site origin used to build absolute URLs in the sitemap.
+SITE_ORIGIN = "https://warpstar.space"
+# Stay well under the 50k-URL / 50MB sitemap limits.
+_SITEMAP_GAME_CAP = 45000
+
+
+@app.get("/sitemap.xml", tags=["seo"], include_in_schema=False)
+async def sitemap(db=Depends(get_db)):
+    """
+    Generates an XML sitemap of indexable pages: the static entry points,
+    every genre, and every game that has at least one review (reviewed games
+    carry unique content — unreviewed pages are thin, so we skip them).
+    """
+    urls: list[str] = [f"{SITE_ORIGIN}/", f"{SITE_ORIGIN}/explore"]
+
+    # Genres
+    async for g in db.genres.find({}, {"name": 1}):
+        name = (g.get("name") or "").strip().lower()
+        if name:
+            urls.append(f"{SITE_ORIGIN}/genre/{escape(name)}")
+
+    # Reviewed games
+    cursor = db.games.find({"reviewTotal": {"$gt": 0}}, {"_id": 1}).limit(_SITEMAP_GAME_CAP)
+    async for game in cursor:
+        urls.append(f"{SITE_ORIGIN}/game/{game['_id']}")
+
+    body = "".join(f"<url><loc>{u}</loc></url>" for u in urls)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{body}</urlset>"
+    )
+    return Response(content=xml, media_type="application/xml")
