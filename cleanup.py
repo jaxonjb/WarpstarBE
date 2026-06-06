@@ -267,14 +267,17 @@ async def migrate_igdb_id_field() -> dict:
     total = await db.games.count_documents(filt)
     logger.info("  %d docs need igdb_id added", total)
 
-    while offset < total:
+    # Do NOT use skip — as docs are updated they leave the filter, so skip
+    # would jump over half the remaining set each pass. Always pull the first
+    # BATCH_SIZE unprocessed docs until none are left.
+    from pymongo import UpdateOne as _UpdateOne
+    while True:
         page = await db.games.find(filt, {"_id": 1, "igdbId": 1}) \
-                             .sort("_id", 1).skip(offset).limit(BATCH_SIZE) \
+                             .sort("_id", 1).limit(BATCH_SIZE) \
                              .to_list(length=BATCH_SIZE)
         if not page:
             break
 
-        from pymongo import UpdateOne as _UpdateOne
         ops = [
             _UpdateOne(
                 {"_id": doc["_id"]},
@@ -288,11 +291,12 @@ async def migrate_igdb_id_field() -> dict:
             try:
                 res      = await db.games.bulk_write(ops, ordered=False)
                 updated += res.modified_count
+                offset  += res.modified_count
             except Exception as exc:
-                logger.error("  bulk_write failed at offset %d: %s", offset, exc)
+                logger.error("  bulk_write failed: %s", exc)
                 errors += 1
+                break
 
-        offset += len(page)
         logger.info("  migrated %d/%d", offset, total)
 
     elapsed = round(time.time() - start, 1)
