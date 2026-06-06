@@ -84,6 +84,17 @@ async def get_current_user(
     return user
 
 
+async def get_current_developer(current_user: dict = Depends(get_current_user)) -> dict:
+    """Require the logged-in user to have role 'developer' or 'admin'."""
+    role = current_user.get("role", "")
+    if role not in ("developer", "admin"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Developer or admin role required.",
+        )
+    return current_user
+
+
 async def get_current_user_optional(
     token: str | None = Depends(OAuth2PasswordBearer(tokenUrl="/api/auth/login", auto_error=False)),
     db=Depends(get_db),

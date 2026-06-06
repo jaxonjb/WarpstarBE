@@ -4,9 +4,12 @@ import asyncio
 import unicodedata
 from fastapi import APIRouter, Depends, HTTPException, Query
 from bson import ObjectId
+from pydantic import BaseModel
 
 from core.database import get_db
+from core.security import get_current_developer
 from core.utils import serialize_doc, serialize_docs
+import igdb_sync
 
 router = APIRouter(prefix="/api/games", tags=["games"])
 
@@ -143,6 +146,39 @@ async def _build_filter(q, genre, platform, theme, db=None) -> dict:
                 except: f["themeIds"] = tdoc["igdbId"]
 
     return f
+
+
+# ---------------------------------------------------------------------------
+# Developer: request a game by IGDB ID
+# ---------------------------------------------------------------------------
+
+class GameRequestBody(BaseModel):
+    igdb_id: int
+
+
+@router.post("/request", status_code=201)
+async def request_game(
+    body: GameRequestBody,
+    db=Depends(get_db),
+    _dev=Depends(get_current_developer),
+):
+    """
+    Fetch a game from IGDB by its numeric ID and upsert it into the database.
+    Applies the same filters as the nightly sync:
+      - Must be a base game (no version_parent)
+      - Must not be Cancelled (6) or Rumored (7)
+      - Must not match a cosmetic-edition name pattern
+    Requires developer or admin role.
+    """
+    try:
+        game_doc = await igdb_sync.fetch_and_upsert_by_igdb_id(body.igdb_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"IGDB error: {exc}")
+
+    maps = await _build_lookup_maps(db)
+    return _resolve_game(game_doc, maps)
 
 
 # ---------------------------------------------------------------------------

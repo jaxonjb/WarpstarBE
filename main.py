@@ -17,6 +17,7 @@ from core.config import get_settings
 from core.database import get_client, close_db, get_db
 from routers import users
 import igdb_sync
+import cleanup
 
 settings = get_settings()
 logger   = logging.getLogger(__name__)
@@ -125,6 +126,41 @@ async def trigger_sync():
     """Manually kick off an IGDB sync without waiting for the 3 AM schedule."""
     asyncio.create_task(_run_sync_task())
     return {"status": "sync started"}
+
+
+@app.post("/admin/cleanup/game-types", tags=["admin"], include_in_schema=False)
+async def trigger_cleanup_game_types():
+    """
+    One-time cleanup: remove all games whose IGDB game_type is not in
+    {0=Main Game, 4=Bundle, 8=Remake, 9=Remaster, 10=Expanded Game}.
+    Runs in the background — returns immediately.
+    """
+    async def _run():
+        try:
+            summary = await cleanup.remove_wrong_game_types()
+            logger.info("Cleanup game-types complete: %s", summary)
+        except Exception:
+            logger.exception("Cleanup game-types failed")
+
+    asyncio.create_task(_run())
+    return {"status": "cleanup started", "job": "remove_wrong_game_types"}
+
+
+@app.post("/admin/cleanup/no-devs", tags=["admin"], include_in_schema=False)
+async def trigger_cleanup_no_devs():
+    """
+    One-time cleanup: cascade-delete all games that have no developerIds.
+    Runs in the background — returns immediately.
+    """
+    async def _run():
+        try:
+            summary = await cleanup.remove_no_developer_games()
+            logger.info("Cleanup no-devs complete: %s", summary)
+        except Exception:
+            logger.exception("Cleanup no-devs failed")
+
+    asyncio.create_task(_run())
+    return {"status": "cleanup started", "job": "remove_no_developer_games"}
 
 
 # Public site origin used to build absolute URLs in the sitemap.
