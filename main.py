@@ -163,6 +163,40 @@ async def trigger_cleanup_no_devs():
     return {"status": "cleanup started", "job": "remove_no_developer_games"}
 
 
+@app.post("/admin/cleanup/migrate-igdb-id", tags=["admin"], include_in_schema=False)
+async def trigger_migrate_igdb_id():
+    """
+    Step 1 of dedup: copy igdbId → igdb_id (string) on old documents that
+    were created by the original import scripts. Safe to re-run.
+    """
+    async def _run():
+        try:
+            summary = await cleanup.migrate_igdb_id_field()
+            logger.info("migrate-igdb-id complete: %s", summary)
+        except Exception:
+            logger.exception("migrate-igdb-id failed")
+
+    asyncio.create_task(_run())
+    return {"status": "cleanup started", "job": "migrate_igdb_id_field"}
+
+
+@app.post("/admin/cleanup/dedup", tags=["admin"], include_in_schema=False)
+async def trigger_dedup():
+    """
+    Step 2 of dedup: find all games sharing the same igdb_id, keep the one
+    with the most reviews, cascade-delete the rest. Run migrate-igdb-id first.
+    """
+    async def _run():
+        try:
+            summary = await cleanup.dedup_games()
+            logger.info("dedup complete: %s", summary)
+        except Exception:
+            logger.exception("dedup failed")
+
+    asyncio.create_task(_run())
+    return {"status": "cleanup started", "job": "dedup_games"}
+
+
 # Public site origin used to build absolute URLs in the sitemap.
 SITE_ORIGIN = "https://warpstar.space"
 # Stay well under the 50k-URL / 50MB sitemap limits.
