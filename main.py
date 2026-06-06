@@ -8,6 +8,11 @@ import asyncio
 import logging
 import traceback
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s  %(name)s: %(message)s",
+)
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
