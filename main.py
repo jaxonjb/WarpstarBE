@@ -48,6 +48,9 @@ async def lifespan(app: FastAPI):
     await client.admin.command("ping")
     print(f"✅  Connected to MongoDB ({settings.db_name})")
 
+    # Ensure DB indexes (idempotent — safe on every restart)
+    await igdb_sync.ensure_indexes()
+
     # Schedule IGDB sync daily at 3:00 AM Pacific time
     _scheduler = AsyncIOScheduler()
     _scheduler.add_job(
